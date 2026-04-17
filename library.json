@@ -1,0 +1,38 @@
+{
+    "name": "ESP-MCP",
+    "version": "0.0.1",
+    "description": "Model Context Protocol server for ESP32. Expose Arduino-side tools to LLM clients over HTTP/JSON-RPC, BLE, or both through a single Tool/ToolHandler API; each transport is compiled in only when its dependencies are present.",
+    "keywords": [
+        "mcp",
+        "server",
+        "esp32",
+        "ble",
+        "http",
+        "llm",
+        "ai"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/solnera/esp-mcp-bootstrap.git"
+    },
+    "authors": [
+        {
+            "name": "Solnera",
+            "email": "liuyf1117@hotmail.com"
+        }
+    ],
+    "license": "MIT",
+    "frameworks": "arduino",
+    "platforms": "espressif32",
+    "build": {
+        "flags": [
+            "-std=gnu++17"
+        ],
+        "unflags": [
+            "-std=gnu++11"
+        ]
+    },
+    "dependencies": {
+        "bblanchon/ArduinoJson": "^7.0.0"
+    }
+}
