@@ -87,6 +87,16 @@ void setup() {
     mcpServer.RegisterTool(getStatusTool);
 
     Serial.println("Starting MCP server...");
+    BleServerConfig bleCfg;
+    bleCfg.txPower = ESP_PWR_LVL_P9;        // +9 dBm, max range
+    bleCfg.advTxPower = ESP_PWR_LVL_P9;
+    bleCfg.advMinInterval = 0x20;           // 20 ms, fast discovery
+    bleCfg.advMaxInterval = 0x30;           // 30 ms
+    bleCfg.connMinInterval = 6;             // 7.5 ms, high throughput
+    bleCfg.connMaxInterval = 12;            // 15 ms
+    bleCfg.connSlaveLatency = 0;            // no skipped events
+    bleCfg.connSupervisionTimeout = 200;    // 2 s
+    mcpServer.setBleConfig(bleCfg);
     mcpServer.begin();
 
     Serial.printf("\n=== MCP Server Ready ===\n");
