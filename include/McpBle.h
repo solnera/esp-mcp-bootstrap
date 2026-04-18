@@ -5,6 +5,29 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <functional>
+#include <string>
+
+struct BleServerConfig {
+    // Advertised device name.
+    std::string deviceName = "MCP_Server_BLE";
+
+    // TX power. txPower applies to default/connection path, advTxPower to advertising.
+    // +3 dBm trades ~40% current vs +9 dBm while still reaching typical phone distances.
+    esp_power_level_t txPower = ESP_PWR_LVL_P3;
+    esp_power_level_t advTxPower = ESP_PWR_LVL_P3;
+
+    // Advertising interval, units of 0.625 ms.
+    uint16_t advMinInterval = 0x320;  // 500 ms
+    uint16_t advMaxInterval = 0x640;  // 1000 ms
+    bool scanResponse = true;
+
+    // Connection parameter update requested on link-up.
+    // Interval units: 1.25 ms. Supervision timeout units: 10 ms.
+    uint16_t connMinInterval = 12;          // 15 ms
+    uint16_t connMaxInterval = 24;          // 30 ms
+    uint16_t connSlaveLatency = 4;
+    uint16_t connSupervisionTimeout = 400;  // 4 s
+};
 
 class McpBle {
 public:
@@ -13,7 +36,10 @@ public:
 
     static McpBle& getInstance();
 
-    void init(const std::string& deviceName = "MCP_Server_BLE");
+    void setConfig(const BleServerConfig& config);
+    const BleServerConfig& getConfig() const;
+
+    void init(const std::string& deviceName = "");
     void setRxCallback(RxCallback cb);
     void setMtuCallback(MtuCallback cb);
     bool sendNotification(const uint8_t* data, size_t len);
@@ -32,6 +58,7 @@ private:
     McpBle(const McpBle&) = delete;
     McpBle& operator=(const McpBle&) = delete;
 
+    BleServerConfig _config;
     RxCallback _rxCallback;
     MtuCallback _mtuCallback;
     uint16_t _mtu = 23;

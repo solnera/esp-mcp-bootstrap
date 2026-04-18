@@ -18,6 +18,10 @@ BLEMCPServer::~BLEMCPServer() {
     end();
 }
 
+void BLEMCPServer::setBleConfig(const BleServerConfig& config) {
+    McpBle::getInstance().setConfig(config);
+}
+
 void BLEMCPServer::begin() {
     if (s_bound && s_bound != this) {
         Serial.println("[MCP_SERVER] Another BLE MCP server is already bound");
