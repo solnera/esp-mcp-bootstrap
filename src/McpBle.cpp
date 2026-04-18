@@ -5,11 +5,12 @@
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) override {
         McpBle::getInstance()._onConnect(pServer);
-        // Connection params balanced for power/latency:
-        //   interval 15-30ms, slave latency 4 (skip up to 4 events when idle),
-        //   supervision timeout 4s.
-        // Effective idle interval: up to 30ms * (4+1) = 150ms between radio wakeups.
-        pServer->updateConnParams(desc->conn_handle, 12, 24, 4, 400);
+        const auto& cfg = McpBle::getInstance().getConfig();
+        pServer->updateConnParams(desc->conn_handle,
+                                  cfg.connMinInterval,
+                                  cfg.connMaxInterval,
+                                  cfg.connSlaveLatency,
+                                  cfg.connSupervisionTimeout);
     }
 
     void onDisconnect(NimBLEServer* pServer) override {
@@ -34,14 +35,24 @@ McpBle& McpBle::getInstance() {
 
 McpBle::McpBle() {}
 
+void McpBle::setConfig(const BleServerConfig& config) {
+    _config = config;
+}
+
+const BleServerConfig& McpBle::getConfig() const {
+    return _config;
+}
+
 void McpBle::init(const std::string& deviceName) {
     if (_initialized) {
         NimBLEDevice::startAdvertising();
         return;
     }
 
-    NimBLEDevice::init(deviceName);
-    NimBLEDevice::setPower(ESP_PWR_LVL_P3); // +3 dBm: sufficient for nearby devices, saves ~40% vs P9
+    const std::string& name = deviceName.empty() ? _config.deviceName : deviceName;
+    NimBLEDevice::init(name);
+    NimBLEDevice::setPower(_config.txPower, ESP_BLE_PWR_TYPE_DEFAULT);
+    NimBLEDevice::setPower(_config.advTxPower, ESP_BLE_PWR_TYPE_ADV);
 
     _pServer = NimBLEDevice::createServer();
     _pServer->setCallbacks(new ServerCallbacks());
@@ -65,11 +76,9 @@ void McpBle::init(const std::string& deviceName) {
 
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
-    pAdvertising->setScanResponse(true);
-    // Slow advertising interval (500ms~1000ms) to reduce idle power draw.
-    // Default ~100ms is unnecessary for MCP discovery.
-    pAdvertising->setMinInterval(0x320);  // 500ms  (0x320 * 0.625ms)
-    pAdvertising->setMaxInterval(0x640);  // 1000ms (0x640 * 0.625ms)
+    pAdvertising->setScanResponse(_config.scanResponse);
+    pAdvertising->setMinInterval(_config.advMinInterval);
+    pAdvertising->setMaxInterval(_config.advMaxInterval);
     pAdvertising->start();
     _initialized = true;
 }

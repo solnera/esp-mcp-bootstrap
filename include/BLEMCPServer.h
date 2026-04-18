@@ -4,6 +4,7 @@
 #if __has_include(<NimBLEDevice.h>)
 
 #include "MCPServer.h"
+#include "McpBle.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -16,6 +17,10 @@ class BLEMCPServer : public MCPServerBase {
                  const String& version = DEFAULT_SERVER_VERSION,
                  const String& instructions = "");
     ~BLEMCPServer();
+
+    // Override BLE defaults (TX power, advertising, connection params, device name).
+    // Must be called before begin() to take effect.
+    void setBleConfig(const BleServerConfig& config);
 
     void begin();
     void end();
