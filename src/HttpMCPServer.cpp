@@ -2,6 +2,7 @@
 
 #include "HttpMCPServer.h"
 #include <ESPmDNS.h>
+#include <WiFi.h>
 #include <esp_system.h>
 #include <new>
 
@@ -110,9 +111,12 @@ void HttpMCPServer::setupMDNS() {
     }
 
     std::string usn = "uuid:" + generateUUID() + "::mcp:device";
+    std::string endpoint =
+        "http://" + std::string(WiFi.localIP().toString().c_str()) + ":" + std::to_string(port) + "/mcp";
 
     MDNS.addService("_mcp", "_tcp", port);
     MDNS.addServiceTxt("_mcp", "_tcp", "path", "/mcp");
+    MDNS.addServiceTxt("_mcp", "_tcp", "endpoint", endpoint.c_str());
     MDNS.addServiceTxt("_mcp", "_tcp", "device_type", "mcp:device");
     MDNS.addServiceTxt("_mcp", "_tcp", "usn", usn.c_str());
 }
