@@ -8,6 +8,8 @@
 
 class HttpMCPServer : public MCPServerBase {
    public:
+    // Construct only after WiFi is connected: setupMDNS() reads WiFi.localIP() to publish the
+    // `endpoint` TXT record, so a pre-connect construction would advertise 0.0.0.0.
     HttpMCPServer(uint16_t port, const String& name = DEFAULT_SERVER_NAME,
                   const String& version = DEFAULT_SERVER_VERSION,
                   const String& instructions = "");
