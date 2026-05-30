@@ -34,7 +34,7 @@ lib_deps =
 ```ini
 lib_deps =
     solnera/ESP-MCP
-    h2zero/NimBLE-Arduino@^1.4.1
+    h2zero/NimBLE-Arduino@^2.0.0
 ```
 
 ### Both transports
@@ -43,7 +43,7 @@ lib_deps =
     solnera/ESP-MCP
     me-no-dev/ESPAsyncWebServer@^1.2.4
     me-no-dev/AsyncTCP@^1.1.1
-    h2zero/NimBLE-Arduino@^1.4.1
+    h2zero/NimBLE-Arduino@^2.0.0
 ```
 
 ## Quick Start

@@ -33,6 +33,7 @@ class McpBle {
 public:
     using RxCallback = std::function<void(const uint8_t* data, size_t len)>;
     using MtuCallback = std::function<void(uint16_t mtu)>;
+    using DisconnectCallback = std::function<void()>;
 
     static McpBle& getInstance();
 
@@ -42,6 +43,7 @@ public:
     void init(const std::string& deviceName = "");
     void setRxCallback(RxCallback cb);
     void setMtuCallback(MtuCallback cb);
+    void setDisconnectCallback(DisconnectCallback cb);
     bool sendNotification(const uint8_t* data, size_t len);
     uint16_t getMtu() const;
     bool isConnected() const;
@@ -61,6 +63,7 @@ private:
     BleServerConfig _config;
     RxCallback _rxCallback;
     MtuCallback _mtuCallback;
+    DisconnectCallback _disconnectCallback;
     uint16_t _mtu = 23;
     bool _connected = false;
     bool _initialized = false;

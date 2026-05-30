@@ -3,27 +3,31 @@
 #include "McpBle.h"
 
 class ServerCallbacks : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) override {
+    void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
         McpBle::getInstance()._onConnect(pServer);
         const auto& cfg = McpBle::getInstance().getConfig();
-        pServer->updateConnParams(desc->conn_handle,
+        pServer->updateConnParams(connInfo.getConnHandle(),
                                   cfg.connMinInterval,
                                   cfg.connMaxInterval,
                                   cfg.connSlaveLatency,
                                   cfg.connSupervisionTimeout);
     }
 
-    void onDisconnect(NimBLEServer* pServer) override {
+    void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+        (void)connInfo;
+        (void)reason;
         McpBle::getInstance()._onDisconnect(pServer);
     }
 
-    void onMTUChange(uint16_t MTU, ble_gap_conn_desc* desc) override {
+    void onMTUChange(uint16_t MTU, NimBLEConnInfo& connInfo) override {
+        (void)connInfo;
         McpBle::getInstance()._onMtuChange(MTU);
     }
 };
 
 class CharCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* pCharacteristic) override {
+    void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
+        (void)connInfo;
         McpBle::getInstance()._onWrite(pCharacteristic);
     }
 };
@@ -51,8 +55,8 @@ void McpBle::init(const std::string& deviceName) {
 
     const std::string& name = deviceName.empty() ? _config.deviceName : deviceName;
     NimBLEDevice::init(name);
-    NimBLEDevice::setPower(_config.txPower, ESP_BLE_PWR_TYPE_DEFAULT);
-    NimBLEDevice::setPower(_config.advTxPower, ESP_BLE_PWR_TYPE_ADV);
+    NimBLEDevice::setPowerLevel(_config.txPower, ESP_BLE_PWR_TYPE_DEFAULT);
+    NimBLEDevice::setPowerLevel(_config.advTxPower, ESP_BLE_PWR_TYPE_ADV);
 
     _pServer = NimBLEDevice::createServer();
     _pServer->setCallbacks(new ServerCallbacks());
@@ -76,7 +80,16 @@ void McpBle::init(const std::string& deviceName) {
 
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
-    pAdvertising->setScanResponse(_config.scanResponse);
+    // NimBLE 2.x no longer advertises the name from NimBLEDevice::init(), and
+    // NimBLEAdvertising::setName() only routes the name into the scan-response
+    // packet when scan response is already enabled (m_scanResp). The 128-bit
+    // service UUID fills the 31-byte main packet, so the name has to live in the
+    // scan response — enable it BEFORE setName(), or setName() fails and the
+    // device advertises unnamed.
+    pAdvertising->enableScanResponse(_config.scanResponse);
+    if (!pAdvertising->setName(name)) {
+        Serial.println("[McpBle] Advertised name did not fit; device will be unnamed");
+    }
     pAdvertising->setMinInterval(_config.advMinInterval);
     pAdvertising->setMaxInterval(_config.advMaxInterval);
     pAdvertising->start();
@@ -91,10 +104,13 @@ void McpBle::setMtuCallback(MtuCallback cb) {
     _mtuCallback = cb;
 }
 
+void McpBle::setDisconnectCallback(DisconnectCallback cb) {
+    _disconnectCallback = cb;
+}
+
 bool McpBle::sendNotification(const uint8_t* data, size_t len) {
     if (!_connected || !_pTxCharacteristic) return false;
-    _pTxCharacteristic->notify(data, len);
-    return true;
+    return _pTxCharacteristic->notify(data, len);
 }
 
 uint16_t McpBle::getMtu() const {
@@ -112,6 +128,9 @@ void McpBle::_onConnect(NimBLEServer* pServer) {
 void McpBle::_onDisconnect(NimBLEServer* pServer) {
     _connected = false;
     _mtu = 23;  // Reset MTU
+    if (_disconnectCallback) {
+        _disconnectCallback();
+    }
     NimBLEDevice::startAdvertising();
 }
 

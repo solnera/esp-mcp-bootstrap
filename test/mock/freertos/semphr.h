@@ -36,6 +36,12 @@ inline SemaphoreHandle_t xSemaphoreCreateBinary() {
     return new MockSemaphore();
 }
 
+inline SemaphoreHandle_t xSemaphoreCreateMutex() {
+    auto* sem = new MockSemaphore();
+    sem->given = true;  // a mutex is created in the available (takeable) state
+    return sem;
+}
+
 inline BaseType_t xSemaphoreGive(SemaphoreHandle_t sem) {
     if (!sem) {
         return pdFALSE;

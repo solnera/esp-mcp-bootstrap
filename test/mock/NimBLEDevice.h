@@ -1,17 +1,50 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <vector>
 
-constexpr int ESP_PWR_LVL_P3 = 3;
+/* Test instrumentation for the notify() path: tracks how many notifications run
+ * concurrently (to prove sends are serialized) and a total call count. */
+namespace mock_ble {
+inline std::atomic<int>& notifyActive() { static std::atomic<int> a{0}; return a; }
+inline std::atomic<int>& notifyMaxConcurrent() { static std::atomic<int> m{0}; return m; }
+inline std::atomic<int>& notifyCount() { static std::atomic<int> c{0}; return c; }
+inline std::atomic<int>& notifyFailCountdown() { static std::atomic<int> f{0}; return f; }
+inline void failNextNotify(int n) { notifyFailCountdown().store(n); }
+inline void resetNotifyTracking() {
+    notifyActive().store(0);
+    notifyMaxConcurrent().store(0);
+    notifyCount().store(0);
+    notifyFailCountdown().store(0);
+}
+// Last name pushed onto the advertisement via NimBLEAdvertising::setName().
+inline std::string& advertisedName() { static std::string s; return s; }
+}  // namespace mock_ble
 
-struct ble_gap_conn_desc {
-    uint16_t conn_handle = 0;
-};
+typedef int esp_power_level_t;
+typedef int esp_ble_power_type_t;
+constexpr esp_power_level_t ESP_PWR_LVL_P3 = 3;
+constexpr esp_ble_power_type_t ESP_BLE_PWR_TYPE_DEFAULT = 0;
+constexpr esp_ble_power_type_t ESP_BLE_PWR_TYPE_ADV = 1;
+
 class NimBLEServer;
 class NimBLECharacteristic;
+
+// Mirrors NimBLE 2.x: connection info passed to server/characteristic callbacks.
+class NimBLEConnInfo {
+public:
+    NimBLEConnInfo() = default;
+    explicit NimBLEConnInfo(uint16_t handle) : handle_(handle) {}
+    uint16_t getConnHandle() const { return handle_; }
+
+private:
+    uint16_t handle_ = 0;
+};
 
 class NimBLEAttValue {
 public:
@@ -28,24 +61,27 @@ private:
 class NimBLEServerCallbacks {
 public:
     virtual ~NimBLEServerCallbacks() = default;
-    virtual void onConnect(NimBLEServer* server, ble_gap_conn_desc* desc) {
+    virtual void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) {
         (void)server;
-        (void)desc;
+        (void)connInfo;
     }
-    virtual void onDisconnect(NimBLEServer* server) {
+    virtual void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) {
         (void)server;
+        (void)connInfo;
+        (void)reason;
     }
-    virtual void onMTUChange(uint16_t mtu, ble_gap_conn_desc* desc) {
+    virtual void onMTUChange(uint16_t mtu, NimBLEConnInfo& connInfo) {
         (void)mtu;
-        (void)desc;
+        (void)connInfo;
     }
 };
 
 class NimBLECharacteristicCallbacks {
 public:
     virtual ~NimBLECharacteristicCallbacks() = default;
-    virtual void onWrite(NimBLECharacteristic* characteristic) {
+    virtual void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& connInfo) {
         (void)characteristic;
+        (void)connInfo;
     }
 };
 
@@ -60,9 +96,22 @@ public:
     void setCallbacks(NimBLECharacteristicCallbacks* callbacks) {
         callbacks_ = callbacks;
     }
-    void notify(const uint8_t* data, size_t len) {
+    bool notify(const uint8_t* data, size_t len) {
         (void)data;
         (void)len;
+        mock_ble::notifyCount().fetch_add(1);
+        int active = mock_ble::notifyActive().fetch_add(1) + 1;
+        int prev = mock_ble::notifyMaxConcurrent().load();
+        while (active > prev &&
+               !mock_ble::notifyMaxConcurrent().compare_exchange_weak(prev, active)) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        mock_ble::notifyActive().fetch_sub(1);
+        if (mock_ble::notifyFailCountdown().load() > 0) {
+            mock_ble::notifyFailCountdown().fetch_sub(1);
+            return false;
+        }
+        return true;
     }
     NimBLEAttValue getValue() const {
         return NimBLEAttValue(value_);
@@ -107,17 +156,45 @@ private:
 
 class NimBLEAdvertising {
 public:
-    void addServiceUUID(const char* uuid) { (void)uuid; }
-    void setScanResponse(bool enabled) { (void)enabled; }
+    void addServiceUUID(const char* uuid) {
+        (void)uuid;
+        hasServiceUUID_ = true;
+    }
+    void enableScanResponse(bool enabled) { scanResp_ = enabled; }
+    // Mirrors NimBLE 2.x NimBLEAdvertising::setName: the name is placed into the
+    // scan-response packet when scan response is enabled; otherwise into the main
+    // advertising packet, which cannot also hold a 128-bit service UUID (18B UUID
+    // + name overflows the 31B packet). In that case setName fails and the name
+    // is left unset — so enableScanResponse() must be called BEFORE setName().
+    bool setName(const std::string& name) {
+        if (scanResp_) {
+            mock_ble::advertisedName() = name;
+            return true;
+        }
+        if (hasServiceUUID_) {
+            return false;  // would overflow the 31-byte main packet
+        }
+        mock_ble::advertisedName() = name;
+        return true;
+    }
     void setMinInterval(uint16_t interval) { (void)interval; }
     void setMaxInterval(uint16_t interval) { (void)interval; }
     void start() {}
+
+private:
+    bool scanResp_ = false;
+    bool hasServiceUUID_ = false;
 };
 
 class NimBLEDevice {
 public:
     static void init(const std::string& deviceName) { (void)deviceName; }
-    static void setPower(int power) { (void)power; }
+    static bool setPowerLevel(esp_power_level_t power,
+                              esp_ble_power_type_t type = ESP_BLE_PWR_TYPE_DEFAULT) {
+        (void)power;
+        (void)type;
+        return true;
+    }
     static NimBLEServer* createServer() {
         static NimBLEServer server;
         return &server;
