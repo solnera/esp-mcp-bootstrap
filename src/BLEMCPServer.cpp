@@ -36,7 +36,7 @@ void BLEMCPServer::begin() {
     exit_flag = false;
 
     if (!rx_queue) {
-        rx_queue = xQueueCreate(4, sizeof(char*));
+        rx_queue = xQueueCreate(MCP_BLE_RX_QUEUE_DEPTH, sizeof(char*));
         if (!rx_queue) {
             Serial.println("[MCP_SERVER] Failed to create BLE RX queue");
             s_bound = nullptr;
@@ -55,9 +55,24 @@ void BLEMCPServer::begin() {
             return;
         }
     }
+    if (!send_mutex) {
+        send_mutex = xSemaphoreCreateMutex();
+        if (!send_mutex) {
+            Serial.println("[MCP_SERVER] Failed to create BLE send mutex");
+            vSemaphoreDelete(task_done);
+            task_done = nullptr;
+            vQueueDelete(rx_queue);
+            rx_queue = nullptr;
+            s_bound = nullptr;
+            exit_flag = true;
+            return;
+        }
+    }
     if (!task_handle) {
         if (xTaskCreate(BLEMCPServer::taskEntry, "mcp_ble_rx", 8192, this, 1, &task_handle) != pdPASS) {
             Serial.println("[MCP_SERVER] Failed to create BLE RX task");
+            vSemaphoreDelete(send_mutex);
+            send_mutex = nullptr;
             vSemaphoreDelete(task_done);
             task_done = nullptr;
             vQueueDelete(rx_queue);
@@ -70,6 +85,7 @@ void BLEMCPServer::begin() {
 
     mcp_transport_set_sleep_fn(BLEMCPServer::sleepTicks, NULL);
     mcp_transport_set_log_fn(BLEMCPServer::logFn, NULL);
+    mcp_transport_set_lock_fn(BLEMCPServer::lockFn, this);
 
     if (!s_initialized) {
         mcp_transport_init();
@@ -80,6 +96,10 @@ void BLEMCPServer::begin() {
 
         McpBle::getInstance().setRxCallback([](const uint8_t* data, size_t len) {
             mcp_transport_receive(data, len);
+        });
+
+        McpBle::getInstance().setDisconnectCallback([]() {
+            mcp_transport_reset_rx();
         });
 
         McpBle::getInstance().setMtuCallback(BLEMCPServer::onMtu);
@@ -98,6 +118,8 @@ void BLEMCPServer::begin() {
 void BLEMCPServer::end() {
     if (s_bound == this) {
         mcp_transport_set_message_cb(NULL, NULL);
+        mcp_transport_set_lock_fn(NULL, NULL);
+        McpBle::getInstance().setDisconnectCallback(nullptr);
     }
 
     if (task_handle) {
@@ -129,6 +151,11 @@ void BLEMCPServer::end() {
         task_done = nullptr;
     }
 
+    if (send_mutex) {
+        vSemaphoreDelete(send_mutex);
+        send_mutex = nullptr;
+    }
+
     if (s_bound == this) {
         mcp_transport_deinit();
         s_bound = nullptr;
@@ -137,19 +164,10 @@ void BLEMCPServer::end() {
 }
 
 void BLEMCPServer::loop() {
-    if (!rx_queue) return;
-    while (true) {
-        char* msg = nullptr;
-        if (xQueueReceive(rx_queue, &msg, 0) != pdTRUE) break;
-        if (exit_flag) {
-            if (msg) free(msg);
-            break;
-        }
-        if (msg) {
-            processMessage(msg);
-            free(msg);
-        }
-    }
+    // Intentionally a no-op. Inbound messages are drained and dispatched by the
+    // RX worker task created in begin(); draining the same queue here would race
+    // that task on the shared transport TX buffer and run handlers concurrently.
+    // Retained for API/source compatibility.
 }
 
 void BLEMCPServer::taskEntry(void* ctx) {
@@ -186,6 +204,9 @@ void BLEMCPServer::onMessage(const char* message, void* ctx) {
     copy[n] = '\0';
     if (xQueueSend(self->rx_queue, &copy, 0) != pdTRUE) {
         free(copy);
+        self->rx_dropped++;
+        Serial.printf("[MCP_SERVER] RX queue full, dropped message (total dropped: %u)\n",
+                      (unsigned)self->rx_dropped);
     }
 }
 
@@ -207,6 +228,16 @@ void BLEMCPServer::logFn(int level, const char* tag, const char* message, void* 
     (void)ctx;
     if (!tag || !message) return;
     Serial.printf("[%s] %s\n", tag, message);
+}
+
+void BLEMCPServer::lockFn(bool lock, void* ctx) {
+    auto* self = static_cast<BLEMCPServer*>(ctx);
+    if (!self || !self->send_mutex) return;
+    if (lock) {
+        xSemaphoreTake(self->send_mutex, portMAX_DELAY);
+    } else {
+        xSemaphoreGive(self->send_mutex);
+    }
 }
 
 void BLEMCPServer::processMessage(const char* message) {

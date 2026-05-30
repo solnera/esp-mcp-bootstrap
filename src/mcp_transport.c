@@ -16,6 +16,14 @@
 #define MAX_MTU 517
 #define MAX_GATT_VALUE_LEN 512
 
+/* RX reassembly buffer is allocated on demand and grown to fit each message,
+ * then shrunk back to this baseline so a single large message does not keep
+ * MAX_MESSAGE_SIZE bytes resident on the heap. */
+#ifndef MCP_TRANSPORT_RX_BASELINE_CAP
+#define MCP_TRANSPORT_RX_BASELINE_CAP 256
+#endif
+#define RX_BASELINE_CAP MCP_TRANSPORT_RX_BASELINE_CAP
+
 /* Protocol Definitions */
 #define HEADER_TYPE_MASK 0xC0
 #define HEADER_SEQ_MASK  0x3F
@@ -26,6 +34,7 @@
 #define TYPE_END    0xC0
 
 static uint8_t *rx_buffer = NULL;
+static size_t rx_buffer_cap = 0;
 static uint8_t *tx_buffer = NULL;
 static size_t rx_received_len = 0;
 static size_t rx_total_len = 0;
@@ -47,6 +56,59 @@ static uint32_t s_tx_gap_ticks = 0;
 static uint8_t s_send_max_retries = 3;
 static uint32_t s_send_retry_delay_ticks = 1;
 static bool s_initialized = false;
+
+#ifdef MCP_TRANSPORT_TEST_HOOKS
+static int s_fail_next_alloc = 0;
+void mcp_transport_test_fail_next_alloc(int n) {
+    s_fail_next_alloc = n;
+}
+#endif
+
+/* realloc wrapper for the RX buffer; honors the test-only failure injection. */
+static void *rx_realloc(void *ptr, size_t size) {
+#ifdef MCP_TRANSPORT_TEST_HOOKS
+    if (s_fail_next_alloc > 0) {
+        s_fail_next_alloc--;
+        return NULL;
+    }
+#endif
+    return realloc(ptr, size);
+}
+
+/* Ensure the RX buffer can hold at least `need` bytes. Grows only; never shrinks.
+ * On allocation failure the existing buffer is left intact and false is returned. */
+static bool rx_ensure_capacity(size_t need) {
+    if (rx_buffer && rx_buffer_cap >= need) {
+        return true;
+    }
+    uint8_t *grown = (uint8_t *)rx_realloc(rx_buffer, need);
+    if (!grown) {
+        return false;
+    }
+    rx_buffer = grown;
+    rx_buffer_cap = need;
+    return true;
+}
+
+/* Release any growth beyond the baseline once a message has been delivered, so a
+ * single large message does not pin a large allocation for the connection's life. */
+static void rx_shrink_to_baseline(void) {
+    if (rx_buffer_cap <= RX_BASELINE_CAP) {
+        return;
+    }
+    uint8_t *shrunk = (uint8_t *)realloc(rx_buffer, RX_BASELINE_CAP);
+    if (shrunk) {
+        rx_buffer = shrunk;
+        rx_buffer_cap = RX_BASELINE_CAP;
+    }
+    /* If shrinking fails we simply keep the larger buffer — harmless. */
+}
+
+static void rx_reset_state(void) {
+    rx_received_len = 0;
+    rx_total_len = 0;
+    rx_in_progress = false;
+}
 
 static void mcp_transport_logf(int level, const char *fmt, ...) {
     if (!s_log_fn) {
@@ -97,11 +159,12 @@ void mcp_transport_init(void) {
         return;
     }
 
-    rx_buffer = (uint8_t *)malloc(MAX_MESSAGE_SIZE + 1);
+    rx_buffer = (uint8_t *)malloc(RX_BASELINE_CAP);
     if (!rx_buffer) {
         mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Failed to allocate RX buffer");
         return;
     }
+    rx_buffer_cap = RX_BASELINE_CAP;
     tx_buffer = (uint8_t *)malloc(MAX_MTU);
     if (!tx_buffer) {
         free(rx_buffer);
@@ -122,11 +185,10 @@ void mcp_transport_deinit(void) {
         free(rx_buffer);
         rx_buffer = NULL;
     }
+    rx_buffer_cap = 0;
 
-    rx_received_len = 0;
-    rx_total_len = 0;
+    rx_reset_state();
     rx_expect_seq_id = 0;
-    rx_in_progress = false;
 
     s_initialized = false;
 }
@@ -169,6 +231,11 @@ void mcp_transport_set_send_retry(uint8_t max_retries, uint32_t retry_delay_tick
     s_send_retry_delay_ticks = retry_delay_ticks;
 }
 
+void mcp_transport_reset_rx(void) {
+    rx_reset_state();
+    rx_shrink_to_baseline();
+}
+
 void mcp_transport_receive(const uint8_t *data, size_t len) {
     if (!rx_buffer) return;
     if (!data) return;
@@ -185,6 +252,10 @@ void mcp_transport_receive(const uint8_t *data, size_t len) {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Message too large");
             return;
         }
+        if (!rx_ensure_capacity(payload_len + 1)) {
+            mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "RX buffer alloc failed: %d", (int)payload_len);
+            return;
+        }
         memcpy(rx_buffer, payload, payload_len);
         rx_buffer[payload_len] = 0;
         mcp_transport_logf(MCP_TRANSPORT_LOG_INFO, "Received Single: %d bytes", (int)payload_len);
@@ -193,9 +264,8 @@ void mcp_transport_receive(const uint8_t *data, size_t len) {
         } else {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Message callback not set");
         }
-        rx_received_len = 0;
-        rx_total_len = 0;
-        rx_in_progress = false;
+        rx_reset_state();
+        rx_shrink_to_baseline();
 
     } else if (type == TYPE_START) {
         if (payload_len < 4) return;
@@ -205,6 +275,12 @@ void mcp_transport_receive(const uint8_t *data, size_t len) {
         if (rx_total_len > MAX_MESSAGE_SIZE) {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Message too large: %d", (int)rx_total_len);
             rx_total_len = 0;
+            return;
+        }
+
+        if (!rx_ensure_capacity(rx_total_len + 1)) {
+            mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "RX buffer alloc failed: %d", (int)rx_total_len);
+            rx_reset_state();
             return;
         }
 
@@ -277,9 +353,8 @@ void mcp_transport_receive(const uint8_t *data, size_t len) {
         } else {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Length mismatch: exp %d, got %d", (int)rx_total_len, (int)rx_received_len);
         }
-        rx_total_len = 0;
-        rx_received_len = 0;
-        rx_in_progress = false;
+        rx_reset_state();
+        rx_shrink_to_baseline();
     }
 }
 

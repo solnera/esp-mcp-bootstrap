@@ -834,6 +834,80 @@ void test_receive_multiple_fragmented_messages(void) {
     TEST_ASSERT_EQUAL_INT(2, g_message_count);
 }
 
+/* ======== Dynamic RX buffer: allocation failure recovery ======== */
+
+void test_receive_start_alloc_failure_drops_and_recovers(void) {
+    /* Message must exceed the baseline RX capacity so that START triggers a real
+     * (growing) allocation — that is the one we force to fail. */
+    char msg[401];
+    for (int i = 0; i < 400; i++) msg[i] = 'A' + (i % 26);
+    msg[400] = '\0';
+    size_t total = 400;
+
+    /* Deliver the message as START (first 200 bytes) + END (last 200 bytes). */
+    uint8_t start[256];
+    size_t start_len;
+    build_start_packet(start, &start_len, 0, total, msg, 200);
+    uint8_t end[256];
+    end[0] = 0xC0 | 1;
+    memcpy(end + 1, msg + 200, 200);
+
+    /* Force the growing allocation on the next START to fail → message dropped. */
+    mcp_transport_test_fail_next_alloc(1);
+    mcp_transport_receive(start, start_len);
+    TEST_ASSERT_FALSE(g_message_received);
+
+    /* A trailing END for the dropped message must be ignored, not crash. */
+    mcp_transport_receive(end, 201);
+    TEST_ASSERT_FALSE(g_message_received);
+
+    /* Transport recovers: the same large message now reassembles correctly. */
+    mcp_transport_receive(start, start_len);
+    mcp_transport_receive(end, 201);
+
+    TEST_ASSERT_TRUE(g_message_received);
+    TEST_ASSERT_EQUAL_STRING(msg, g_received_message);
+}
+
+/* ======== Reset RX (e.g. on disconnect) ======== */
+
+void test_reset_rx_aborts_in_progress_reassembly(void) {
+    const char *msg = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"; /* 26 bytes */
+    size_t total = strlen(msg);
+
+    /* Begin a fragmented message, leaving reassembly in progress. */
+    uint8_t start[64];
+    size_t start_len;
+    build_start_packet(start, &start_len, 0, total, msg, 10);
+    mcp_transport_receive(start, start_len);
+
+    /* Reset mid-reassembly (simulates a BLE disconnect). */
+    mcp_transport_reset_rx();
+
+    /* Fragments that would have completed the aborted message must be ignored —
+     * not mistakenly stitched onto stale state. */
+    uint8_t cont[64];
+    cont[0] = 0x80 | 1;
+    memcpy(cont + 1, msg + 10, 10);
+    mcp_transport_receive(cont, 11);
+    uint8_t end[64];
+    end[0] = 0xC0 | 2;
+    memcpy(end + 1, msg + 20, 6);
+    mcp_transport_receive(end, 7);
+    TEST_ASSERT_FALSE(g_message_received);
+
+    /* A fresh message after the reset reassembles correctly. */
+    mcp_transport_receive(start, start_len);
+    cont[0] = 0x80 | 1;
+    memcpy(cont + 1, msg + 10, 10);
+    mcp_transport_receive(cont, 11);
+    end[0] = 0xC0 | 2;
+    memcpy(end + 1, msg + 20, 6);
+    mcp_transport_receive(end, 7);
+    TEST_ASSERT_TRUE(g_message_received);
+    TEST_ASSERT_EQUAL_STRING(msg, g_received_message);
+}
+
 /* ======== Main ======== */
 
 int main(void) {
@@ -898,6 +972,12 @@ int main(void) {
     RUN_TEST(test_send_empty_message);
     RUN_TEST(test_send_null_message_ignored);
     RUN_TEST(test_receive_multiple_fragmented_messages);
+
+    /* Dynamic RX buffer */
+    RUN_TEST(test_receive_start_alloc_failure_drops_and_recovers);
+
+    /* Reset RX */
+    RUN_TEST(test_reset_rx_aborts_in_progress_reassembly);
 
     return UNITY_END();
 }

@@ -11,6 +11,13 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+// Depth of the RX hand-off queue between the BLE write callback and the worker
+// task. A full queue means requests are arriving faster than they are handled;
+// overflow is counted (see droppedMessageCount) rather than dropped silently.
+#ifndef MCP_BLE_RX_QUEUE_DEPTH
+#define MCP_BLE_RX_QUEUE_DEPTH 16
+#endif
+
 class BLEMCPServer : public MCPServerBase {
    public:
     BLEMCPServer(const String& name = "ESP32-MCP-BLE",
@@ -26,6 +33,10 @@ class BLEMCPServer : public MCPServerBase {
     void end();
     void loop();
 
+    // Number of inbound messages dropped because the RX queue was full.
+    // Non-zero means the peer is sending faster than handlers can keep up.
+    uint32_t droppedMessageCount() const { return rx_dropped; }
+
    private:
     static void onMessage(const char* message, void* ctx);
     void processMessage(const char* message);
@@ -36,11 +47,14 @@ class BLEMCPServer : public MCPServerBase {
     static void onMtu(uint16_t mtu);
     static void sleepTicks(uint32_t ticks, void* ctx);
     static void logFn(int level, const char* tag, const char* message, void* ctx);
+    static void lockFn(bool lock, void* ctx);
 
     QueueHandle_t rx_queue = nullptr;
     TaskHandle_t task_handle = nullptr;
     SemaphoreHandle_t task_done = nullptr;
+    SemaphoreHandle_t send_mutex = nullptr;
     volatile bool exit_flag = false;
+    volatile uint32_t rx_dropped = 0;
 
     static BLEMCPServer* s_bound;
     static bool s_initialized;
