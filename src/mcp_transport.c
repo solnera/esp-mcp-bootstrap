@@ -154,6 +154,45 @@ static bool mcp_transport_send_packet(const uint8_t *data, size_t len) {
     return false;
 }
 
+void mcp_transport_send_error(uint8_t code, const char *detail) {
+    if (!s_send_fn || !tx_buffer) {
+        mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Transport not ready");
+        return;
+    }
+
+    if (s_lock_fn) {
+        s_lock_fn(true, s_lock_ctx);
+    }
+
+    size_t packet_len_max = mcp_transport_max_packet_len();
+    if (packet_len_max < 3) {
+        mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "MTU too small for error frame");
+        if (s_lock_fn) s_lock_fn(false, s_lock_ctx);
+        return;
+    }
+
+    tx_buffer[0] = MCP_TRANSPORT_CONTROL_HEADER;
+    tx_buffer[1] = MCP_TRANSPORT_CONTROL_ERROR;
+    tx_buffer[2] = code;
+
+    size_t detail_len = detail ? strlen(detail) : 0;
+    size_t max_detail_len = packet_len_max - 3;
+    if (detail_len > max_detail_len) {
+        detail_len = max_detail_len;
+    }
+    if (detail_len > 0) {
+        memcpy(tx_buffer + 3, detail, detail_len);
+    }
+
+    if (!mcp_transport_send_packet(tx_buffer, 3 + detail_len)) {
+        mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Error frame send failed");
+    }
+
+    if (s_lock_fn) {
+        s_lock_fn(false, s_lock_ctx);
+    }
+}
+
 void mcp_transport_init(void) {
     if (s_initialized) {
         return;
@@ -247,13 +286,22 @@ void mcp_transport_receive(const uint8_t *data, size_t len) {
     const uint8_t *payload = data + 1;
     size_t payload_len = len - 1;
 
+    if (header == MCP_TRANSPORT_CONTROL_HEADER) {
+        if (payload_len >= 2 && payload[0] == MCP_TRANSPORT_CONTROL_ERROR) {
+            mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Peer transport error: %d", (int)payload[1]);
+        }
+        return;
+    }
+
     if (type == TYPE_SINGLE) {
         if (payload_len > MAX_MESSAGE_SIZE) {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Message too large");
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_MESSAGE_TOO_LARGE, "single too large");
             return;
         }
         if (!rx_ensure_capacity(payload_len + 1)) {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "RX buffer alloc failed: %d", (int)payload_len);
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_OOM, "rx oom");
             return;
         }
         memcpy(rx_buffer, payload, payload_len);
@@ -268,19 +316,25 @@ void mcp_transport_receive(const uint8_t *data, size_t len) {
         rx_shrink_to_baseline();
 
     } else if (type == TYPE_START) {
-        if (payload_len < 4) return;
+        if (payload_len < 4) {
+            mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Start payload too short");
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_BAD_SEQUENCE, "start too short");
+            return;
+        }
 
         rx_total_len = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3];
 
         if (rx_total_len > MAX_MESSAGE_SIZE) {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Message too large: %d", (int)rx_total_len);
             rx_total_len = 0;
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_MESSAGE_TOO_LARGE, "start too large");
             return;
         }
 
         if (!rx_ensure_capacity(rx_total_len + 1)) {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "RX buffer alloc failed: %d", (int)rx_total_len);
             rx_reset_state();
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_OOM, "rx oom");
             return;
         }
 
@@ -294,19 +348,23 @@ void mcp_transport_receive(const uint8_t *data, size_t len) {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Start payload too large");
             rx_total_len = 0;
             rx_in_progress = false;
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_OVERFLOW, "start overflow");
             return;
         }
         memcpy(rx_buffer + rx_received_len, payload, payload_len);
         rx_received_len += payload_len;
 
     } else if (type == TYPE_CONT) {
-        if (rx_total_len == 0) return;
-        if (!rx_in_progress) return;
+        if (rx_total_len == 0 || !rx_in_progress) {
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_BAD_SEQUENCE, "cont without start");
+            return;
+        }
         if (seq_id != rx_expect_seq_id) {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Sequence mismatch");
             rx_total_len = 0;
             rx_received_len = 0;
             rx_in_progress = false;
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_BAD_SEQUENCE, "bad sequence");
             return;
         }
         rx_expect_seq_id = (uint8_t)((rx_expect_seq_id + 1) & HEADER_SEQ_MASK);
@@ -316,19 +374,23 @@ void mcp_transport_receive(const uint8_t *data, size_t len) {
             rx_total_len = 0;
             rx_received_len = 0;
             rx_in_progress = false;
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_OVERFLOW, "cont overflow");
             return;
         }
         memcpy(rx_buffer + rx_received_len, payload, payload_len);
         rx_received_len += payload_len;
 
     } else if (type == TYPE_END) {
-        if (rx_total_len == 0) return;
-        if (!rx_in_progress) return;
+        if (rx_total_len == 0 || !rx_in_progress) {
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_BAD_SEQUENCE, "end without start");
+            return;
+        }
         if (seq_id != rx_expect_seq_id) {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Sequence mismatch");
             rx_total_len = 0;
             rx_received_len = 0;
             rx_in_progress = false;
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_BAD_SEQUENCE, "bad sequence");
             return;
         }
 
@@ -337,6 +399,7 @@ void mcp_transport_receive(const uint8_t *data, size_t len) {
             rx_total_len = 0;
             rx_received_len = 0;
             rx_in_progress = false;
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_OVERFLOW, "end overflow");
             return;
         }
         memcpy(rx_buffer + rx_received_len, payload, payload_len);
@@ -352,6 +415,7 @@ void mcp_transport_receive(const uint8_t *data, size_t len) {
             }
         } else {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Length mismatch: exp %d, got %d", (int)rx_total_len, (int)rx_received_len);
+            mcp_transport_send_error(MCP_TRANSPORT_ERR_LENGTH_MISMATCH, "length mismatch");
         }
         rx_reset_state();
         rx_shrink_to_baseline();
@@ -369,15 +433,15 @@ void mcp_transport_send_message(const char *json_message) {
         return;
     }
 
-    if (s_lock_fn) {
-        s_lock_fn(true, s_lock_ctx);
-    }
-
     size_t total_len = strlen(json_message);
     if (total_len > MAX_MESSAGE_SIZE) {
         mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Message too large");
-        if (s_lock_fn) s_lock_fn(false, s_lock_ctx);
+        mcp_transport_send_error(MCP_TRANSPORT_ERR_MESSAGE_TOO_LARGE, "send too large");
         return;
+    }
+
+    if (s_lock_fn) {
+        s_lock_fn(true, s_lock_ctx);
     }
 
     size_t offset = 0;

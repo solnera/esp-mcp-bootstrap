@@ -7,6 +7,12 @@
 
 #define MAX_CAPTURED_PACKETS 128
 #define MAX_PACKET_SIZE 600
+#define EXPECT_CONTROL_HEADER 0x3F
+#define EXPECT_CONTROL_ERROR 0x01
+#define EXPECT_ERR_MESSAGE_TOO_LARGE 1
+#define EXPECT_ERR_BAD_SEQUENCE 2
+#define EXPECT_ERR_OVERFLOW 3
+#define EXPECT_ERR_LENGTH_MISMATCH 4
 
 static char g_received_message[8192];
 static int  g_message_received;
@@ -47,6 +53,14 @@ static void reset_state(void) {
     memset(g_sent_packet_lens, 0, sizeof(g_sent_packet_lens));
     g_sent_packet_count = 0;
     g_send_fail_remaining = 0;
+}
+
+static void assert_error_frame(uint8_t expected_code) {
+    TEST_ASSERT_EQUAL_INT(1, g_sent_packet_count);
+    TEST_ASSERT_GREATER_OR_EQUAL(3, (int)g_sent_packet_lens[0]);
+    TEST_ASSERT_EQUAL_UINT8(EXPECT_CONTROL_HEADER, g_sent_packets[0][0]);
+    TEST_ASSERT_EQUAL_UINT8(EXPECT_CONTROL_ERROR, g_sent_packets[0][1]);
+    TEST_ASSERT_EQUAL_UINT8(expected_code, g_sent_packets[0][2]);
 }
 
 void setUp(void) {
@@ -227,6 +241,8 @@ void test_receive_sequence_mismatch(void) {
     memcpy(cont + 1, msg + 10, 10);
     mcp_transport_receive(cont, 11);
 
+    assert_error_frame(EXPECT_ERR_BAD_SEQUENCE);
+
     /* END should be ignored (reassembly was aborted) */
     uint8_t end[64];
     end[0] = 0xC0 | 6;
@@ -240,12 +256,14 @@ void test_receive_cont_without_start(void) {
     uint8_t pkt[] = {0x80 | 0, 'A', 'B', 'C'};
     mcp_transport_receive(pkt, sizeof(pkt));
     TEST_ASSERT_FALSE(g_message_received);
+    assert_error_frame(EXPECT_ERR_BAD_SEQUENCE);
 }
 
 void test_receive_end_without_start(void) {
     uint8_t pkt[] = {0xC0 | 0, 'A', 'B', 'C'};
     mcp_transport_receive(pkt, sizeof(pkt));
     TEST_ASSERT_FALSE(g_message_received);
+    assert_error_frame(EXPECT_ERR_BAD_SEQUENCE);
 }
 
 void test_receive_start_too_large(void) {
@@ -261,6 +279,7 @@ void test_receive_start_too_large(void) {
 
     mcp_transport_receive(pkt, sizeof(pkt));
     TEST_ASSERT_FALSE(g_message_received);
+    assert_error_frame(EXPECT_ERR_MESSAGE_TOO_LARGE);
 }
 
 void test_receive_no_callback_no_crash(void) {
@@ -440,7 +459,7 @@ void test_send_too_large(void) {
     big[8199] = '\0';
 
     mcp_transport_send_message(big);
-    TEST_ASSERT_EQUAL_INT(0, g_sent_packet_count);
+    assert_error_frame(EXPECT_ERR_MESSAGE_TOO_LARGE);
     free(big);
 }
 
@@ -684,6 +703,7 @@ void test_receive_start_payload_too_short(void) {
 
     mcp_transport_receive(pkt, sizeof(pkt));
     TEST_ASSERT_FALSE(g_message_received);
+    assert_error_frame(EXPECT_ERR_BAD_SEQUENCE);
 }
 
 /* ======== CONT overflow protection ======== */
@@ -704,6 +724,7 @@ void test_receive_cont_overflow(void) {
 
     /* Should have been rejected, no message received */
     TEST_ASSERT_FALSE(g_message_received);
+    assert_error_frame(EXPECT_ERR_OVERFLOW);
 }
 
 void test_receive_end_overflow(void) {
@@ -720,6 +741,7 @@ void test_receive_end_overflow(void) {
     mcp_transport_receive(end, 11);
 
     TEST_ASSERT_FALSE(g_message_received);
+    assert_error_frame(EXPECT_ERR_OVERFLOW);
 }
 
 /* ======== MTU edge cases ======== */
@@ -784,6 +806,7 @@ void test_receive_end_length_mismatch(void) {
 
     /* Length mismatch → message not delivered */
     TEST_ASSERT_FALSE(g_message_received);
+    assert_error_frame(EXPECT_ERR_LENGTH_MISMATCH);
 }
 
 /* ======== send_message with NULL ======== */

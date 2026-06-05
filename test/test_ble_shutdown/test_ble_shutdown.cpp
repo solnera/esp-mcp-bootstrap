@@ -11,6 +11,11 @@
 #include "BLEMCPServer.h"
 #include "mcp_transport.h"
 
+constexpr uint8_t EXPECT_CONTROL_HEADER = 0x3F;
+constexpr uint8_t EXPECT_CONTROL_ERROR = 0x01;
+constexpr uint8_t EXPECT_ERR_BAD_SEQUENCE = 2;
+constexpr uint8_t EXPECT_ERR_BUSY = 6;
+
 class BlockingHandler : public ToolHandler {
 public:
     BlockingHandler(std::atomic<bool>& started, std::atomic<bool>& release)
@@ -106,6 +111,84 @@ void test_concurrent_sends_are_serialized(void) {
     TEST_ASSERT_EQUAL_INT(1, maxConcurrent);
 }
 
+void test_second_connection_is_rejected_without_dropping_active_session(void) {
+    BLEMCPServer server("test-ble", "1.0.0");
+    server.begin();
+
+    auto& ble = McpBle::getInstance();
+    auto* nimServer = NimBLEDevice::createServer();
+    NimBLEConnInfo first(7);
+    NimBLEConnInfo second(9);
+
+    mock_ble::resetConnectionTracking();
+    bool firstAccepted = ble._onConnect(nimServer, first);
+    bool secondAccepted = ble._onConnect(nimServer, second);
+
+    TEST_ASSERT_TRUE(firstAccepted);
+    TEST_ASSERT_FALSE(secondAccepted);
+    TEST_ASSERT_TRUE(ble.isConnected());
+    TEST_ASSERT_EQUAL_UINT16(7, ble.activeConnHandle());
+    TEST_ASSERT_EQUAL_INT(1, mock_ble::disconnectCount().load());
+    TEST_ASSERT_EQUAL_INT(9, mock_ble::lastDisconnectConnHandle().load());
+
+    ble._onDisconnect(nimServer, second, 0);
+    TEST_ASSERT_TRUE(ble.isConnected());
+    TEST_ASSERT_EQUAL_UINT16(7, ble.activeConnHandle());
+
+    ble._onDisconnect(nimServer, first, 0);
+    TEST_ASSERT_FALSE(ble.isConnected());
+
+    server.end();
+}
+
+void test_non_active_client_writes_are_ignored(void) {
+    BLEMCPServer server("test-ble", "1.0.0");
+    server.begin();
+
+    auto& ble = McpBle::getInstance();
+    NimBLEConnInfo active(7);
+    NimBLEConnInfo other(9);
+    ble._onConnect(NimBLEDevice::createServer(), active);
+
+    int callbackCount = 0;
+    ble.setRxCallback([&callbackCount](const uint8_t* data, size_t len) {
+        (void)data;
+        (void)len;
+        callbackCount++;
+    });
+
+    NimBLECharacteristic characteristic;
+    characteristic.setValue(std::vector<uint8_t>{'{', '}'});
+
+    ble._onWrite(&characteristic, other);
+    TEST_ASSERT_EQUAL_INT(0, callbackCount);
+
+    ble._onWrite(&characteristic, active);
+    TEST_ASSERT_EQUAL_INT(1, callbackCount);
+
+    ble._onDisconnect(NimBLEDevice::createServer(), active, 0);
+    server.end();
+}
+
+void test_notifications_target_active_connection(void) {
+    BLEMCPServer server("test-ble", "1.0.0");
+    server.begin();
+
+    auto& ble = McpBle::getInstance();
+    NimBLEConnInfo active(7);
+    ble._onConnect(NimBLEDevice::createServer(), active);
+
+    const uint8_t payload[] = {'o', 'k'};
+    mock_ble::resetNotifyTracking();
+    bool ok = ble.sendNotification(payload, sizeof(payload));
+
+    ble._onDisconnect(NimBLEDevice::createServer(), active, 0);
+    server.end();
+
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_EQUAL_INT(7, mock_ble::lastNotifyConnHandle().load());
+}
+
 void test_disconnect_discards_partial_message(void) {
     BLEMCPServer server("test-ble", "1.0.0");
 
@@ -141,7 +224,8 @@ void test_disconnect_discards_partial_message(void) {
     mock_ble::resetNotifyTracking();
     ble._onConnect(nullptr);
 
-    /* The leftover END from the previous connection must NOT complete a message. */
+    /* The leftover END from the previous connection must NOT complete a message;
+     * it should fail fast with a transport BAD_SEQUENCE frame. */
     const size_t rest = total - firstChunk;
     std::vector<uint8_t> end(1 + rest);
     end[0] = 0xC0 | 1;  // TYPE_END, seq 1
@@ -149,12 +233,17 @@ void test_disconnect_discards_partial_message(void) {
     mcp_transport_receive(end.data(), end.size());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(150));  // let the worker run
-    int responses = mock_ble::notifyCount().load();
+    int notifications = mock_ble::notifyCount().load();
+    std::vector<uint8_t> lastNotify = mock_ble::lastNotifyPayload();
 
     ble._onDisconnect(nullptr);
     server.end();
 
-    TEST_ASSERT_EQUAL_INT(0, responses);
+    TEST_ASSERT_EQUAL_INT(1, notifications);
+    TEST_ASSERT_GREATER_OR_EQUAL(3, static_cast<int>(lastNotify.size()));
+    TEST_ASSERT_EQUAL_UINT8(EXPECT_CONTROL_HEADER, lastNotify[0]);
+    TEST_ASSERT_EQUAL_UINT8(EXPECT_CONTROL_ERROR, lastNotify[1]);
+    TEST_ASSERT_EQUAL_UINT8(EXPECT_ERR_BAD_SEQUENCE, lastNotify[2]);
 }
 
 void test_end_waits_until_worker_task_exits(void) {
@@ -252,6 +341,7 @@ void test_rx_queue_overflow_is_counted_not_silent(void) {
     server.RegisterTool(tool);
 
     server.begin();
+    McpBle::getInstance()._onConnect(nullptr);
 
     /* First request is picked up by the worker, which then blocks — so nothing
      * drains the queue while we overrun it. */
@@ -265,17 +355,25 @@ void test_rx_queue_overflow_is_counted_not_silent(void) {
     }
 
     /* Fill the queue to capacity and then push one more than it can hold. */
+    mock_ble::resetNotifyTracking();
     for (int i = 0; i < MCP_BLE_RX_QUEUE_DEPTH + 4; i++) {
         sendSingleMessage("{}");
     }
 
     uint32_t dropped = server.droppedMessageCount();
+    std::vector<uint8_t> lastNotify = mock_ble::lastNotifyPayload();
 
     release.store(true);
+    McpBle::getInstance()._onDisconnect(nullptr);
     server.end();
 
     /* The overflow must be observable, not dropped silently. */
     TEST_ASSERT_GREATER_OR_EQUAL(1, static_cast<int>(dropped));
+    TEST_ASSERT_GREATER_OR_EQUAL(1, mock_ble::notifyCount().load());
+    TEST_ASSERT_GREATER_OR_EQUAL(3, static_cast<int>(lastNotify.size()));
+    TEST_ASSERT_EQUAL_UINT8(EXPECT_CONTROL_HEADER, lastNotify[0]);
+    TEST_ASSERT_EQUAL_UINT8(EXPECT_CONTROL_ERROR, lastNotify[1]);
+    TEST_ASSERT_EQUAL_UINT8(EXPECT_ERR_BUSY, lastNotify[2]);
 }
 
 void test_loop_does_not_consume_queue(void) {
@@ -390,6 +488,9 @@ int main(int argc, char** argv) {
     RUN_TEST(test_end_waits_until_worker_task_exits);
     RUN_TEST(test_end_waits_past_five_second_timeout_until_handler_finishes);
     RUN_TEST(test_concurrent_sends_are_serialized);
+    RUN_TEST(test_second_connection_is_rejected_without_dropping_active_session);
+    RUN_TEST(test_non_active_client_writes_are_ignored);
+    RUN_TEST(test_notifications_target_active_connection);
     RUN_TEST(test_disconnect_discards_partial_message);
     RUN_TEST(test_rx_queue_overflow_is_counted_not_silent);
     RUN_TEST(test_loop_does_not_consume_queue);

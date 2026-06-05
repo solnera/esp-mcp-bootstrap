@@ -27,10 +27,25 @@ typedef void (*mcp_transport_log_fn_t)(int level, const char *tag, const char *m
 typedef void (*mcp_transport_lock_fn_t)(bool lock, void *ctx);
 
 enum {
+    MCP_TRANSPORT_CONTROL_HEADER = 0x3F,
+    MCP_TRANSPORT_CONTROL_ERROR = 0x01,
+};
+
+enum {
     MCP_TRANSPORT_LOG_ERROR = 1,
     MCP_TRANSPORT_LOG_WARN = 2,
     MCP_TRANSPORT_LOG_INFO = 3,
     MCP_TRANSPORT_LOG_DEBUG = 4,
+};
+
+enum {
+    MCP_TRANSPORT_ERR_MESSAGE_TOO_LARGE = 1,
+    MCP_TRANSPORT_ERR_BAD_SEQUENCE = 2,
+    MCP_TRANSPORT_ERR_OVERFLOW = 3,
+    MCP_TRANSPORT_ERR_LENGTH_MISMATCH = 4,
+    MCP_TRANSPORT_ERR_OOM = 5,
+    MCP_TRANSPORT_ERR_BUSY = 6,
+    MCP_TRANSPORT_ERR_SEND_FAILED = 7,
 };
 
 void mcp_transport_init(void);
@@ -45,6 +60,7 @@ void mcp_transport_set_tx_gap_ticks(uint32_t gap_ticks);
 void mcp_transport_set_send_retry(uint8_t max_retries, uint32_t retry_delay_ticks);
 void mcp_transport_receive(const uint8_t *data, size_t len);
 void mcp_transport_send_message(const char *json_message);
+void mcp_transport_send_error(uint8_t code, const char *detail);
 
 /* Abort any in-progress RX reassembly and release growth back to baseline.
  * Call on link loss (e.g. BLE disconnect) so a partial message cannot be
