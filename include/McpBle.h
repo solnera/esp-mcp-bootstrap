@@ -47,12 +47,17 @@ public:
     bool sendNotification(const uint8_t* data, size_t len);
     uint16_t getMtu() const;
     bool isConnected() const;
+    uint16_t activeConnHandle() const;
 
     // Internal usage
-    void _onConnect(NimBLEServer* pServer);
+    bool _onConnect(NimBLEServer* pServer);
+    bool _onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo);
     void _onDisconnect(NimBLEServer* pServer);
+    void _onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason);
     void _onMtuChange(uint16_t mtu);
+    void _onMtuChange(uint16_t mtu, NimBLEConnInfo& connInfo);
     void _onWrite(NimBLECharacteristic* pCharacteristic);
+    void _onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo);
 
 private:
     McpBle();
@@ -66,6 +71,7 @@ private:
     DisconnectCallback _disconnectCallback;
     uint16_t _mtu = 23;
     bool _connected = false;
+    uint16_t _activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
     bool _initialized = false;
     NimBLEServer* _pServer = nullptr;
     NimBLECharacteristic* _pTxCharacteristic = nullptr;

@@ -207,6 +207,7 @@ void BLEMCPServer::onMessage(const char* message, void* ctx) {
         self->rx_dropped++;
         Serial.printf("[MCP_SERVER] RX queue full, dropped message (total dropped: %u)\n",
                       (unsigned)self->rx_dropped);
+        mcp_transport_send_error(MCP_TRANSPORT_ERR_BUSY, "rx queue full");
     }
 }
 

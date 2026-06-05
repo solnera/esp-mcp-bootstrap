@@ -160,7 +160,33 @@ All MCP protocol logic (initialize, tools/list, tools/call, etc.) is implemented
 - **`BLEMCPServer(name, version, instructions)`** - Constructor.
 - **`RegisterTool(tool)`** - Register an MCP tool.
 - **`begin()`** - Initialize BLE and start advertising.
-- **`loop()`** - Optional polling for message processing (a background FreeRTOS task handles this by default).
+- **`loop()`** - API-compatible no-op. A background FreeRTOS task handles BLE message processing.
+
+### BLE transport limits
+
+The BLE transport is designed as a small-message control/configuration channel,
+not a bulk-data channel.
+
+- BLE MCP is single-client. The first connected central becomes the active MCP
+  session; additional centrals are disconnected so fragmented messages, MTU
+  state, and responses cannot be mixed across clients.
+- A single reassembled MCP message defaults to `8192` bytes
+  (`-DMCP_TRANSPORT_MAX_MESSAGE_SIZE=<bytes>`). Keep normal BLE responses around
+  `1-2 KiB` when possible; larger values depend on available contiguous heap,
+  negotiated MTU, and client-side timeout behavior.
+- Only one fragmented message may be in progress per connection. Clients should
+  subscribe to the TX notification characteristic before writing requests and
+  send large responses through application-level pagination/chunk tools.
+- Transport errors are reported as a reserved control notification instead of
+  relying on client-side timeouts. Error frames use header `0x3F`, opcode `0x01`,
+  then one error-code byte and optional ASCII detail text. Defined error codes:
+  `1` message too large, `2` bad sequence, `3` overflow, `4` length mismatch,
+  `5` out of memory, `6` busy, and `7` send failed/reserved. A physical notify
+  failure is retried and logged locally because it cannot be reliably reported
+  over the same failed link. Clients should abort the current in-flight write on
+  received error frames and retry or back off according to the error code.
+- For large data transfer, use BLE to negotiate/control the operation and move
+  the payload through HTTP/WiFi or a chunked tool API.
 
 ## Examples
 

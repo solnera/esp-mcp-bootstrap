@@ -15,12 +15,26 @@ inline std::atomic<int>& notifyActive() { static std::atomic<int> a{0}; return a
 inline std::atomic<int>& notifyMaxConcurrent() { static std::atomic<int> m{0}; return m; }
 inline std::atomic<int>& notifyCount() { static std::atomic<int> c{0}; return c; }
 inline std::atomic<int>& notifyFailCountdown() { static std::atomic<int> f{0}; return f; }
+inline std::atomic<int>& lastNotifyConnHandle() { static std::atomic<int> h{-1}; return h; }
+inline std::atomic<int>& disconnectCount() { static std::atomic<int> c{0}; return c; }
+inline std::atomic<int>& lastDisconnectConnHandle() { static std::atomic<int> h{-1}; return h; }
+inline std::atomic<int>& stopAdvertisingCount() { static std::atomic<int> c{0}; return c; }
+inline std::atomic<int>& startAdvertisingCount() { static std::atomic<int> c{0}; return c; }
+inline std::vector<uint8_t>& lastNotifyPayload() { static std::vector<uint8_t> p; return p; }
 inline void failNextNotify(int n) { notifyFailCountdown().store(n); }
 inline void resetNotifyTracking() {
     notifyActive().store(0);
     notifyMaxConcurrent().store(0);
     notifyCount().store(0);
     notifyFailCountdown().store(0);
+    lastNotifyConnHandle().store(-1);
+    lastNotifyPayload().clear();
+}
+inline void resetConnectionTracking() {
+    disconnectCount().store(0);
+    lastDisconnectConnHandle().store(-1);
+    stopAdvertisingCount().store(0);
+    startAdvertisingCount().store(0);
 }
 // Last name pushed onto the advertisement via NimBLEAdvertising::setName().
 inline std::string& advertisedName() { static std::string s; return s; }
@@ -31,6 +45,8 @@ typedef int esp_ble_power_type_t;
 constexpr esp_power_level_t ESP_PWR_LVL_P3 = 3;
 constexpr esp_ble_power_type_t ESP_BLE_PWR_TYPE_DEFAULT = 0;
 constexpr esp_ble_power_type_t ESP_BLE_PWR_TYPE_ADV = 1;
+constexpr uint16_t BLE_HS_CONN_HANDLE_NONE = 0xFFFF;
+constexpr uint8_t BLE_ERR_REM_USER_CONN_TERM = 0x13;
 
 class NimBLEServer;
 class NimBLECharacteristic;
@@ -96,9 +112,9 @@ public:
     void setCallbacks(NimBLECharacteristicCallbacks* callbacks) {
         callbacks_ = callbacks;
     }
-    bool notify(const uint8_t* data, size_t len) {
-        (void)data;
-        (void)len;
+    bool notify(const uint8_t* data, size_t len, uint16_t connHandle = BLE_HS_CONN_HANDLE_NONE) {
+        mock_ble::lastNotifyPayload().assign(data, data + len);
+        mock_ble::lastNotifyConnHandle().store(static_cast<int>(connHandle));
         mock_ble::notifyCount().fetch_add(1);
         int active = mock_ble::notifyActive().fetch_add(1) + 1;
         int prev = mock_ble::notifyMaxConcurrent().load();
@@ -115,6 +131,9 @@ public:
     }
     NimBLEAttValue getValue() const {
         return NimBLEAttValue(value_);
+    }
+    void setValue(const std::vector<uint8_t>& value) {
+        value_ = value;
     }
 
 private:
@@ -148,6 +167,23 @@ public:
         (void)max_interval;
         (void)latency;
         (void)timeout;
+    }
+    bool disconnect(uint16_t connHandle, uint8_t reason = BLE_ERR_REM_USER_CONN_TERM) {
+        (void)reason;
+        mock_ble::disconnectCount().fetch_add(1);
+        mock_ble::lastDisconnectConnHandle().store(static_cast<int>(connHandle));
+        return true;
+    }
+    bool disconnect(const NimBLEConnInfo& connInfo, uint8_t reason = BLE_ERR_REM_USER_CONN_TERM) {
+        return disconnect(connInfo.getConnHandle(), reason);
+    }
+    bool stopAdvertising() {
+        mock_ble::stopAdvertisingCount().fetch_add(1);
+        return true;
+    }
+    bool startAdvertising() {
+        mock_ble::startAdvertisingCount().fetch_add(1);
+        return true;
     }
 
 private:
@@ -203,5 +239,12 @@ public:
         static NimBLEAdvertising advertising;
         return &advertising;
     }
-    static void startAdvertising() {}
+    static bool startAdvertising() {
+        mock_ble::startAdvertisingCount().fetch_add(1);
+        return true;
+    }
+    static bool stopAdvertising() {
+        mock_ble::stopAdvertisingCount().fetch_add(1);
+        return true;
+    }
 };

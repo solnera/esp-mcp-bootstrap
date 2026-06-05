@@ -4,7 +4,9 @@
 
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
-        McpBle::getInstance()._onConnect(pServer);
+        if (!McpBle::getInstance()._onConnect(pServer, connInfo)) {
+            return;
+        }
         const auto& cfg = McpBle::getInstance().getConfig();
         pServer->updateConnParams(connInfo.getConnHandle(),
                                   cfg.connMinInterval,
@@ -14,21 +16,17 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     }
 
     void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
-        (void)connInfo;
-        (void)reason;
-        McpBle::getInstance()._onDisconnect(pServer);
+        McpBle::getInstance()._onDisconnect(pServer, connInfo, reason);
     }
 
     void onMTUChange(uint16_t MTU, NimBLEConnInfo& connInfo) override {
-        (void)connInfo;
-        McpBle::getInstance()._onMtuChange(MTU);
+        McpBle::getInstance()._onMtuChange(MTU, connInfo);
     }
 };
 
 class CharCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
-        (void)connInfo;
-        McpBle::getInstance()._onWrite(pCharacteristic);
+        McpBle::getInstance()._onWrite(pCharacteristic, connInfo);
     }
 };
 
@@ -110,7 +108,7 @@ void McpBle::setDisconnectCallback(DisconnectCallback cb) {
 
 bool McpBle::sendNotification(const uint8_t* data, size_t len) {
     if (!_connected || !_pTxCharacteristic) return false;
-    return _pTxCharacteristic->notify(data, len);
+    return _pTxCharacteristic->notify(data, len, _activeConnHandle);
 }
 
 uint16_t McpBle::getMtu() const {
@@ -121,17 +119,56 @@ bool McpBle::isConnected() const {
     return _connected;
 }
 
-void McpBle::_onConnect(NimBLEServer* pServer) {
+uint16_t McpBle::activeConnHandle() const {
+    return _activeConnHandle;
+}
+
+bool McpBle::_onConnect(NimBLEServer* pServer) {
     _connected = true;
+    _activeConnHandle = 0;
+    if (pServer) {
+        pServer->stopAdvertising();
+    } else {
+        NimBLEDevice::stopAdvertising();
+    }
+    return true;
 }
 
 void McpBle::_onDisconnect(NimBLEServer* pServer) {
     _connected = false;
+    _activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
     _mtu = 23;  // Reset MTU
     if (_disconnectCallback) {
         _disconnectCallback();
     }
     NimBLEDevice::startAdvertising();
+}
+
+bool McpBle::_onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
+    const uint16_t connHandle = connInfo.getConnHandle();
+    if (_connected && _activeConnHandle != connHandle) {
+        if (pServer) {
+            pServer->disconnect(connHandle);
+        }
+        return false;
+    }
+
+    _connected = true;
+    _activeConnHandle = connHandle;
+    if (pServer) {
+        pServer->stopAdvertising();
+    } else {
+        NimBLEDevice::stopAdvertising();
+    }
+    return true;
+}
+
+void McpBle::_onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) {
+    (void)reason;
+    if (!_connected || connInfo.getConnHandle() != _activeConnHandle) {
+        return;
+    }
+    _onDisconnect(pServer);
 }
 
 void McpBle::_onMtuChange(uint16_t mtu) {
@@ -141,6 +178,13 @@ void McpBle::_onMtuChange(uint16_t mtu) {
     }
 }
 
+void McpBle::_onMtuChange(uint16_t mtu, NimBLEConnInfo& connInfo) {
+    if (!_connected || connInfo.getConnHandle() != _activeConnHandle) {
+        return;
+    }
+    _onMtuChange(mtu);
+}
+
 void McpBle::_onWrite(NimBLECharacteristic* pCharacteristic) {
     if (_rxCallback) {
         NimBLEAttValue value = pCharacteristic->getValue();
@@ -148,6 +192,13 @@ void McpBle::_onWrite(NimBLECharacteristic* pCharacteristic) {
             _rxCallback(value.data(), value.size());
         }
     }
+}
+
+void McpBle::_onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) {
+    if (!_connected || connInfo.getConnHandle() != _activeConnHandle) {
+        return;
+    }
+    _onWrite(pCharacteristic);
 }
 
 #endif  // __has_include(<NimBLEDevice.h>)
