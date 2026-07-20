@@ -5,6 +5,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 struct MockSemaphore {
@@ -14,6 +16,7 @@ struct MockSemaphore {
     bool given = false;
     size_t waiters = 0;
     bool deleted = false;
+    bool is_mutex = false;
 };
 
 using SemaphoreHandle_t = MockSemaphore*;
@@ -39,6 +42,7 @@ inline SemaphoreHandle_t xSemaphoreCreateBinary() {
 inline SemaphoreHandle_t xSemaphoreCreateMutex() {
     auto* sem = new MockSemaphore();
     sem->given = true;  // a mutex is created in the available (takeable) state
+    sem->is_mutex = true;
     return sem;
 }
 
@@ -106,6 +110,13 @@ inline void vSemaphoreDelete(SemaphoreHandle_t sem) {
         return;
     }
     std::unique_lock<std::mutex> lock(sem->mutex);
+    if (sem->is_mutex && !sem->given) {
+        /* Real FreeRTOS documents deleting a held mutex as undefined behavior.
+         * The forgiving mock used to mask exactly the teardown-ordering bug the
+         * production code once had, so fail loudly instead. */
+        fprintf(stderr, "vSemaphoreDelete: deleting a mutex that is currently held\n");
+        abort();
+    }
     sem->deleted = true;
     sem->cv.notify_all();
     sem->delete_cv.wait(lock, [&] { return sem->waiters == 0; });

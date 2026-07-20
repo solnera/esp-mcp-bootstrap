@@ -6,6 +6,7 @@
 #include <cstring>
 
 const char* const PROTOCOL_VERSION = "2025-11-25";
+const char* const PROTOCOL_VERSION_2025_06_18 = "2025-06-18";
 const char* const PROTOCOL_VERSION_2025_03_26 = "2025-03-26";
 const char* const PROTOCOL_VERSION_2024_11_05 = "2024-11-05";
 const char* const DEFAULT_SERVER_NAME = "ESP32-MCP-Server";
@@ -138,7 +139,11 @@ MCPRequest MCPServerBase::parseRequest(const std::string& json) {
     }
 
     JsonObjectConst root = doc.as<JsonObjectConst>();
-    request.method = root["method"].as<std::string>();
+    /* JSON-RPC requires method to be a string. as<std::string>() must not be
+     * used here: on a missing/non-string member it serializes the value,
+     * turning an absent method into the literal string "null". */
+    JsonVariantConst methodVar = root["method"];
+    request.method = methodVar.is<const char*>() ? methodVar.as<const char*>() : "";
     request.hasIdField = !root["id"].isUnbound();
     request.idDoc.set(root["id"]);
     request.paramsDoc.set(root["params"]);
@@ -167,22 +172,36 @@ std::string MCPServerBase::serializeResponse(const MCPResponse& response) {
 }
 
 MCPResponse MCPServerBase::handle(MCPRequest& request) {
-    if (request.method.empty()) {
+    if (request.parseError) {
         return createJSONRPCError(400, static_cast<int>(ErrorCode::PARSE_ERROR), request.id(), "Parse error: Invalid JSON");
+    }
+
+    if (request.method.empty()) {
+        // Syntactically valid JSON that is not a JSON-RPC request (no method).
+        return createJSONRPCError(400, static_cast<int>(ErrorCode::INVALID_REQUEST), request.id(),
+                                  "Invalid Request: missing method");
+    }
+
+    if (request.isNotification()) {
+        // JSON-RPC 2.0: a notification never receives a response, whether the
+        // method is known or not. notifications/initialized carries no state we
+        // need to track, so acknowledging at the transport level is all that's
+        // required (HTTP maps this to 202 Accepted with no body; BLE sends nothing).
+        return MCPResponse(202, false);
     }
 
     if (request.method == "initialize") {
         return handleInitialize(request);
+    } else if (request.method == "ping") {
+        return handlePing(request);
     } else if (request.method == "tools/list") {
         return handleToolsList(request);
-    } else if (request.method == "notifications/initialized") {
-        return handleInitialized(request);
     } else if (request.method == "tools/call") {
         return handleFunctionCalls(request);
+    } else if (request.method == "notifications/initialized") {
+        return createJSONRPCError(200, static_cast<int>(ErrorCode::INVALID_REQUEST), request.id(),
+                                  "notifications/initialized must be sent as a notification");
     } else {
-        if (request.isNotification()) {
-            return MCPResponse(202, false);
-        }
         return createJSONRPCError(200, static_cast<int>(ErrorCode::METHOD_NOT_FOUND), request.id(),
                                   "Method not found: " + request.method);
     }
@@ -208,11 +227,12 @@ MCPResponse MCPServerBase::handleInitialize(MCPRequest& request) {
     return response;
 }
 
-MCPResponse MCPServerBase::handleInitialized(MCPRequest& request) {
-    if (request.isNotification()) {
-        return MCPResponse(202, false);
-    }
-    return MCPResponse(202, request.id());
+MCPResponse MCPServerBase::handlePing(MCPRequest& request) {
+    MCPResponse response(200, request.id());
+    // The spec requires a prompt empty-result response; clients use ping to
+    // probe liveness and may drop the connection on a -32601.
+    response.resultDoc.to<JsonObject>();
+    return response;
 }
 
 MCPResponse MCPServerBase::handleToolsList(MCPRequest& request) {
@@ -280,6 +300,7 @@ bool MCPServerBase::isSupportedProtocolVersion(const char* version) const {
         return false;
     }
     return strcmp(version, PROTOCOL_VERSION) == 0 ||
+           strcmp(version, PROTOCOL_VERSION_2025_06_18) == 0 ||
            strcmp(version, PROTOCOL_VERSION_2025_03_26) == 0 ||
            strcmp(version, PROTOCOL_VERSION_2024_11_05) == 0;
 }

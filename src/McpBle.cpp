@@ -35,7 +35,34 @@ McpBle& McpBle::getInstance() {
     return instance;
 }
 
-McpBle::McpBle() {}
+McpBle::McpBle() {
+    _cbMutex = xSemaphoreCreateMutex();
+}
+
+namespace {
+
+/* RAII guard for _cbMutex. Tolerates a null mutex (allocation failure) by
+ * degrading to the previous unguarded behavior. */
+class CbLock {
+public:
+    explicit CbLock(SemaphoreHandle_t mutex) : _mutex(mutex) {
+        if (_mutex) {
+            xSemaphoreTake(_mutex, portMAX_DELAY);
+        }
+    }
+    ~CbLock() {
+        if (_mutex) {
+            xSemaphoreGive(_mutex);
+        }
+    }
+    CbLock(const CbLock&) = delete;
+    CbLock& operator=(const CbLock&) = delete;
+
+private:
+    SemaphoreHandle_t _mutex;
+};
+
+}  // namespace
 
 void McpBle::setConfig(const BleServerConfig& config) {
     _config = config;
@@ -47,9 +74,11 @@ const BleServerConfig& McpBle::getConfig() const {
 
 void McpBle::init(const std::string& deviceName) {
     if (_initialized) {
+        _stopped = false;
         NimBLEDevice::startAdvertising();
         return;
     }
+    _stopped = false;
 
     const std::string& name = deviceName.empty() ? _config.deviceName : deviceName;
     NimBLEDevice::init(name);
@@ -94,15 +123,38 @@ void McpBle::init(const std::string& deviceName) {
     _initialized = true;
 }
 
+void McpBle::stop() {
+    if (!_initialized) {
+        return;
+    }
+    /* _stopped is set under _cbMutex and _onDisconnect re-checks it under the
+     * same mutex before restarting advertising, so a peer-initiated disconnect
+     * racing stop() either sees the flag, or its restart is ordered before the
+     * stopAdvertising() below — which then wins. The mutex is NOT held across
+     * the NimBLE calls (only the host task may take _cbMutex and then NimBLE's
+     * internal locks; taking them in the other order here could deadlock). */
+    {
+        CbLock lock(_cbMutex);
+        _stopped = true;
+    }
+    NimBLEDevice::stopAdvertising();
+    if (_connected && _pServer) {
+        _pServer->disconnect(_activeConnHandle);
+    }
+}
+
 void McpBle::setRxCallback(RxCallback cb) {
+    CbLock lock(_cbMutex);
     _rxCallback = cb;
 }
 
 void McpBle::setMtuCallback(MtuCallback cb) {
+    CbLock lock(_cbMutex);
     _mtuCallback = cb;
 }
 
 void McpBle::setDisconnectCallback(DisconnectCallback cb) {
+    CbLock lock(_cbMutex);
     _disconnectCallback = cb;
 }
 
@@ -135,17 +187,44 @@ bool McpBle::_onConnect(NimBLEServer* pServer) {
 }
 
 void McpBle::_onDisconnect(NimBLEServer* pServer) {
+    (void)pServer;
     _connected = false;
     _activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
     _mtu = 23;  // Reset MTU
-    if (_disconnectCallback) {
-        _disconnectCallback();
+    {
+        CbLock lock(_cbMutex);
+        /* Propagate the ATT-default MTU to listeners. Without this the
+         * transport keeps the previous connection's negotiated MTU and frames
+         * the next connection's pre-negotiation traffic too large to notify. */
+        if (_mtuCallback) {
+            _mtuCallback(_mtu);
+        }
+        if (_disconnectCallback) {
+            _disconnectCallback();
+        }
+        /* Checked under _cbMutex so it cannot race stop() setting the flag —
+         * otherwise a peer disconnect landing during end() could restart
+         * advertising after teardown completed. */
+        if (!_stopped) {
+            NimBLEDevice::startAdvertising();
+        }
     }
-    NimBLEDevice::startAdvertising();
 }
 
 bool McpBle::_onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
     const uint16_t connHandle = connInfo.getConnHandle();
+    {
+        /* A connection the controller accepted just before stop() took effect
+         * can be delivered after teardown; admitting it would strand the
+         * central on a server whose callbacks are gone. Drop it. */
+        CbLock lock(_cbMutex);
+        if (_stopped) {
+            if (pServer) {
+                pServer->disconnect(connHandle);
+            }
+            return false;
+        }
+    }
     if (_connected && _activeConnHandle != connHandle) {
         if (pServer) {
             pServer->disconnect(connHandle);
@@ -173,6 +252,7 @@ void McpBle::_onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int 
 
 void McpBle::_onMtuChange(uint16_t mtu) {
     _mtu = mtu;
+    CbLock lock(_cbMutex);
     if (_mtuCallback) {
         _mtuCallback(_mtu);
     }
@@ -186,6 +266,7 @@ void McpBle::_onMtuChange(uint16_t mtu, NimBLEConnInfo& connInfo) {
 }
 
 void McpBle::_onWrite(NimBLECharacteristic* pCharacteristic) {
+    CbLock lock(_cbMutex);
     if (_rxCallback) {
         NimBLEAttValue value = pCharacteristic->getValue();
         if (value.size() > 0) {

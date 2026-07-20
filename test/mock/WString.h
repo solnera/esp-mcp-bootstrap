@@ -16,6 +16,10 @@ public:
     const char* c_str() const { return _str.c_str(); }
     unsigned int length() const { return (unsigned int)_str.length(); }
 
+    bool startsWith(const String& prefix) const {
+        return _str.compare(0, prefix._str.size(), prefix._str) == 0;
+    }
+
     bool operator==(const String& other) const { return _str == other._str; }
     bool operator!=(const String& other) const { return _str != other._str; }
     bool operator<(const String& other) const { return _str < other._str; }

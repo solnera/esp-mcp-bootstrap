@@ -1,8 +1,9 @@
-name: PlatformIO Registry Publish
+name: CI
 
 on:
-  release:
-    types: [published] # 当你发布一个新的 Release 时触发
+  push:
+  pull_request:
+    branches: [main]
 
 jobs:
   test:
@@ -24,8 +25,25 @@ jobs:
       - name: Run native tests under ASan/UBSan
         run: pio test -e native-san
         env:
+          # alloc_dealloc_mismatch catches new/delete objects handed to a
+          # free()-based teardown (the ESPAsyncWebServer _tempObject contract).
+          # Leak checking stays off: the NimBLE mocks intentionally drop a few
+          # one-time allocations (characteristics/services created in init()).
           ASAN_OPTIONS: alloc_dealloc_mismatch=1:detect_leaks=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
 
       - name: Static analysis (cppcheck)
         run: pio check -e native --fail-on-defect=high --fail-on-defect=medium
@@ -62,6 +80,9 @@ jobs:
             ~/.platformio/.cache
           key: pio-${{ runner.os }}-espressif32
 
+      # --lib . injects the WORKING TREE as the library, bypassing the
+      # registry pin in the example's own platformio.ini — so every push
+      # verifies current code + examples under the real xtensa toolchain.
       - name: Build example against working tree
         run: >
           pio ci examples/${{ matrix.example }}/src
@@ -71,24 +92,3 @@ jobs:
           --project-option="framework=arduino"
           --project-option="build_flags=-std=gnu++17"
           --project-option="lib_deps=${{ matrix.libs }}"
-
-  publish:
-    runs-on: ubuntu-latest
-    # Never ship to the registry with a red suite, a static-analysis defect,
-    # or an example that no longer compiles on the device toolchain.
-    needs: [test, build-examples]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Install PlatformIO
-        run: pip install -U platformio
-
-      - name: Publish Library
-        run: pio pkg publish --non-interactive
-        env:
-          PLATFORMIO_AUTH_TOKEN: ${{ secrets.PLATFORMIO_AUTH_TOKEN }}

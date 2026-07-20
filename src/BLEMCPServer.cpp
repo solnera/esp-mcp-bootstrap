@@ -116,12 +116,24 @@ void BLEMCPServer::begin() {
 }
 
 void BLEMCPServer::end() {
-    if (s_bound == this) {
-        mcp_transport_set_message_cb(NULL, NULL);
-        mcp_transport_set_lock_fn(NULL, NULL);
-        McpBle::getInstance().setDisconnectCallback(nullptr);
+    if (task_handle && xTaskGetCurrentTaskHandle() == task_handle) {
+        /* Called from inside a ToolHandler: end() joins the worker task that is
+         * running this very handler, which can never complete — a guaranteed
+         * self-deadlock. Refuse; call end() from another task instead. */
+        Serial.println("[MCP_SERVER] end() called from the BLE worker task; ignoring (would self-deadlock)");
+        return;
     }
 
+    /* Teardown order matters:
+     * 1. Join the worker task FIRST, while the transport lock fn is still
+     *    installed. Clearing the lock fn before the join let a mid-send worker
+     *    skip its unlock (acquire and release each re-check s_lock_fn), leaving
+     *    send_mutex held forever — and then deleting it below.
+     * 2. Quiesce the BLE side: stop advertising, drop the client, detach the
+     *    McpBle callbacks. The setters block until an in-flight invocation on
+     *    the NimBLE host task returns, so after this block the host task can no
+     *    longer be inside the transport.
+     * 3. Only then delete the FreeRTOS objects and free the transport buffers. */
     if (task_handle) {
         exit_flag = true;
         char* sentinel = nullptr;
@@ -132,6 +144,15 @@ void BLEMCPServer::end() {
             xSemaphoreTake(task_done, portMAX_DELAY);
         }
         task_handle = nullptr;
+    }
+
+    if (s_bound == this) {
+        McpBle::getInstance().stop();
+        McpBle::getInstance().setRxCallback(nullptr);
+        McpBle::getInstance().setMtuCallback(nullptr);
+        McpBle::getInstance().setDisconnectCallback(nullptr);
+        mcp_transport_set_message_cb(NULL, NULL);
+        mcp_transport_set_lock_fn(NULL, NULL);
     }
 
     if (rx_queue) {

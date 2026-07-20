@@ -7,6 +7,9 @@
 #include <functional>
 #include <string>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 struct BleServerConfig {
     // Advertised device name.
     std::string deviceName = "MCP_Server_BLE";
@@ -41,6 +44,14 @@ public:
     const BleServerConfig& getConfig() const;
 
     void init(const std::string& deviceName = "");
+
+    // Stop advertising and drop the active connection (if any). Advertising is
+    // NOT restarted by the resulting disconnect event; call init() to resume.
+    void stop();
+
+    // Callback setters synchronize with in-flight callback invocations: on
+    // return, the previous callback is guaranteed not to be executing on the
+    // NimBLE host task and will never run again.
     void setRxCallback(RxCallback cb);
     void setMtuCallback(MtuCallback cb);
     void setDisconnectCallback(DisconnectCallback cb);
@@ -73,6 +84,12 @@ private:
     bool _connected = false;
     uint16_t _activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
     bool _initialized = false;
+    bool _stopped = false;
+
+    // Serializes callback invocation (NimBLE host task) against callback
+    // reassignment (user task), so teardown can quiesce the host task before
+    // freeing the resources those callbacks touch.
+    SemaphoreHandle_t _cbMutex = nullptr;
     NimBLEServer* _pServer = nullptr;
     NimBLECharacteristic* _pTxCharacteristic = nullptr;
 

@@ -9,7 +9,7 @@ Unified MCP (Model Context Protocol) Server library for ESP32. Supports both **H
 - **BLE transport** - MCP over Bluetooth Low Energy with automatic message fragmentation
 - **Dual transport** - Use both HTTP and BLE simultaneously in a single project
 - **Conditional compilation** - Only the transports whose dependencies are present get compiled
-- **Protocol negotiation** - Defaults to MCP `2025-11-25` while accepting supported legacy initialize versions
+- **Protocol negotiation** - Defaults to MCP `2025-11-25` while accepting `2025-06-18`, `2025-03-26`, and `2024-11-05` initialize versions; `ping` is answered per spec
 
 ## Installation
 
@@ -154,12 +154,15 @@ All MCP protocol logic (initialize, tools/list, tools/call, etc.) is implemented
 
 - **`HttpMCPServer(port, name, version, instructions)`** - Constructor. Starts HTTP server immediately. This lightweight transport returns JSON responses over POST and responds `405` to GET because server-to-client SSE streams are not implemented.
 - **`RegisterTool(tool)`** - Register an MCP tool.
+- POST bodies are capped at `8192` bytes (`-DMCP_HTTP_MAX_BODY_SIZE=<bytes>`); larger requests are rejected with HTTP `413` before any buffering, so a hostile Content-Length cannot exhaust the heap. Non-JSON content types get `415`. A request without a usable Content-Length is answered `411` as a defensive fallback (ESPAsyncWebServer 1.2.x does not support chunked request bodies).
+- JSON-RPC notifications receive `202 Accepted` with no body, per the MCP Streamable HTTP transport.
 
 ### BLEMCPServer
 
 - **`BLEMCPServer(name, version, instructions)`** - Constructor.
 - **`RegisterTool(tool)`** - Register an MCP tool.
 - **`begin()`** - Initialize BLE and start advertising.
+- **`end()`** - Full teardown: joins the worker task, stops advertising, disconnects the active central, and quiesces the NimBLE host task before releasing transport buffers. Advertising stays off until the next `begin()`. Do **not** call `end()` from inside a `ToolHandler` — it joins the worker task that runs handlers, which would self-deadlock; such calls are detected and ignored with a log line.
 - **`loop()`** - API-compatible no-op. A background FreeRTOS task handles BLE message processing.
 
 ### BLE transport limits

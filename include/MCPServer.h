@@ -11,6 +11,7 @@
 // MCP protocol versions supported by this library. The default is the latest
 // version used when the client does not request a supported legacy version.
 extern const char* const PROTOCOL_VERSION;
+extern const char* const PROTOCOL_VERSION_2025_06_18;
 extern const char* const PROTOCOL_VERSION_2025_03_26;
 extern const char* const PROTOCOL_VERSION_2024_11_05;
 extern const char* const DEFAULT_SERVER_NAME;
@@ -205,7 +206,7 @@ class MCPServerBase {
     MCPResponse createJSONRPCError(int httpCode, int rpcCode, const JsonVariantConst& id, const std::string& message);
     MCPResponse handle(MCPRequest& request);
     MCPResponse handleInitialize(MCPRequest& request);
-    MCPResponse handleInitialized(MCPRequest& request);
+    MCPResponse handlePing(MCPRequest& request);
     MCPResponse handleToolsList(MCPRequest& request);
     MCPResponse handleFunctionCalls(MCPRequest& request);
     bool isSupportedProtocolVersion(const char* version) const;
