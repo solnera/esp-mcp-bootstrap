@@ -34,6 +34,13 @@ inline void vTaskDelay(TickType_t ticks) {
     std::this_thread::sleep_for(std::chrono::milliseconds(ticks));
 }
 
+inline TaskHandle_t xTaskGetCurrentTaskHandle() {
+    /* The mock cannot map the calling std::thread back to the std::thread*
+     * that xTaskCreate returned, so self-join detection is inert in native
+     * tests; it is exercised on real FreeRTOS only. */
+    return nullptr;
+}
+
 inline void vTaskDelete(TaskHandle_t task) {
     if (!task) {
         return;

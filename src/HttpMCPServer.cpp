@@ -4,7 +4,29 @@
 #include <ESPmDNS.h>
 #include <WiFi.h>
 #include <esp_system.h>
-#include <new>
+
+#include <cstdlib>
+#include <cstring>
+
+namespace {
+
+/* Accumulated POST body, stored in request->_tempObject. ESPAsyncWebServer
+ * releases _tempObject with free() when a request dies (including aborted
+ * uploads), so this must be one malloc() block with no destructor — anything
+ * else either leaks or corrupts the heap on disconnect. */
+struct BodyBuffer {
+    size_t received;
+    uint8_t status;
+    char data[1];  // over-allocated to hold the body plus a NUL terminator
+};
+
+enum : uint8_t {
+    BODY_OK = 0,
+    BODY_TOO_LARGE = 1,
+    BODY_NO_LENGTH = 2,
+};
+
+}  // namespace
 
 HttpMCPServer::HttpMCPServer(uint16_t port, const String& name, const String& version, const String& instructions)
     : MCPServerBase(name, version, instructions), port(port) {
@@ -21,37 +43,44 @@ HttpMCPServer::~HttpMCPServer() {
 }
 
 void HttpMCPServer::setupWebServer() {
+    /* The body callback only accumulates; the response is always sent from the
+     * onRequest callback, which runs once the request is complete — including
+     * when there is no body at all (previously such POSTs hung with no reply). */
     server->on(
-        "/mcp", HTTP_POST, [this](AsyncWebServerRequest* request) {}, NULL,
+        "/mcp", HTTP_POST, [this](AsyncWebServerRequest* request) { handlePostComplete(request); }, NULL,
         [this](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
-            String* body = nullptr;
-            if (index == 0) {
-                body = new (std::nothrow) String();
-                if (!body) {
-                    request->send(500, "application/json", "{\"error\":\"Out of memory\"}");
-                    return;
-                }
-                body->reserve(total);
-                request->_tempObject = body;
-            } else {
-                body = static_cast<String*>(request->_tempObject);
-            }
-
+            BodyBuffer* body = static_cast<BodyBuffer*>(request->_tempObject);
             if (!body) {
-                request->send(500, "application/json", "{\"error\":\"Request body state missing\"}");
-                return;
+                if (index != 0) {
+                    return;  // first-chunk allocation failed; drop the rest
+                }
+                uint8_t status = BODY_OK;
+                size_t cap = total;
+                if (total == 0) {
+                    // Chunked upload with no Content-Length; we can't size the buffer.
+                    status = BODY_NO_LENGTH;
+                    cap = 0;
+                } else if (total > MCP_HTTP_MAX_BODY_SIZE) {
+                    status = BODY_TOO_LARGE;
+                    cap = 0;
+                }
+                body = static_cast<BodyBuffer*>(malloc(sizeof(BodyBuffer) + cap));
+                if (!body) {
+                    return;  // handlePostComplete reports the OOM
+                }
+                body->received = 0;
+                body->status = status;
+                request->_tempObject = body;
             }
 
-            body->concat((const char*)data, len);
-
-            if (index + len < total) {
+            if (body->status != BODY_OK || index >= total) {
                 return;
             }
-
-            String completeBody = *body;
-            delete body;
-            request->_tempObject = nullptr;
-            handleJsonBody(request, completeBody);
+            if (index + len > total) {
+                len = total - index;  // clamp clients that overshoot their declared Content-Length
+            }
+            memcpy(body->data + index, data, len);
+            body->received = index + len;
         });
 
     server->on("/mcp", HTTP_DELETE, [this](AsyncWebServerRequest* request) {
@@ -69,11 +98,7 @@ void HttpMCPServer::setupWebServer() {
     });
 
     server->onNotFound([this](AsyncWebServerRequest* request) {
-        JsonDocument nullId;
-        nullId.set(nullptr);
-        MCPResponse res = createJSONRPCError(404, static_cast<int>(ErrorCode::INVALID_REQUEST),
-                                             nullId.as<JsonVariantConst>(), "Path Not Found");
-        sendMCPResponse(request, res);
+        sendJSONRPCError(request, 404, ErrorCode::INVALID_REQUEST, "Path Not Found");
     });
 
     server->begin();
@@ -121,17 +146,59 @@ void HttpMCPServer::setupMDNS() {
     MDNS.addServiceTxt("_mcp", "_tcp", "usn", usn.c_str());
 }
 
-void HttpMCPServer::handleJsonBody(AsyncWebServerRequest* request, const String& body) {
-    if (!validateOriginHeader(request)) {
-        JsonDocument nullId;
-        nullId.set(nullptr);
-        MCPResponse forbidden = createJSONRPCError(403, static_cast<int>(ErrorCode::INVALID_REQUEST),
-                                                   nullId.as<JsonVariantConst>(), "Forbidden Origin");
-        sendMCPResponse(request, forbidden);
+void HttpMCPServer::sendJSONRPCError(AsyncWebServerRequest* request, int httpCode, ErrorCode rpcCode,
+                                     const char* message) {
+    JsonDocument nullId;
+    nullId.set(nullptr);
+    MCPResponse error = createJSONRPCError(httpCode, static_cast<int>(rpcCode), nullId.as<JsonVariantConst>(), message);
+    sendMCPResponse(request, error);
+}
+
+void HttpMCPServer::handlePostComplete(AsyncWebServerRequest* request) {
+    BodyBuffer* body = static_cast<BodyBuffer*>(request->_tempObject);
+
+    if (!body) {
+        if (request->contentLength() == 0) {
+            // No body at all; let the parser produce the JSON-RPC parse error.
+            handleJsonBody(request, "");
+            return;
+        }
+        const String& contentType = request->contentType();
+        if (contentType.length() > 0 && !contentType.startsWith("application/json")) {
+            /* ESPAsyncWebServer consumes urlencoded/multipart bodies itself and
+             * never invokes our body callback — not an allocation failure. */
+            sendJSONRPCError(request, 415, ErrorCode::INVALID_REQUEST, "Content-Type must be application/json");
+        } else {
+            // The body callback could not allocate the accumulation buffer.
+            sendJSONRPCError(request, 500, ErrorCode::INTERNAL_ERROR, "Out of memory");
+        }
         return;
     }
 
-    MCPRequest mcpReq = parseRequest(body.c_str());
+    const uint8_t status = body->status;
+    const size_t received = body->received;
+    if (status == BODY_OK && received == request->contentLength()) {
+        body->data[received] = '\0';
+        handleJsonBody(request, body->data);
+    } else if (status == BODY_TOO_LARGE) {
+        sendJSONRPCError(request, 413, ErrorCode::INVALID_REQUEST, "Request body too large");
+    } else if (status == BODY_NO_LENGTH) {
+        sendJSONRPCError(request, 411, ErrorCode::INVALID_REQUEST, "Content-Length required");
+    } else {
+        sendJSONRPCError(request, 400, ErrorCode::INVALID_REQUEST, "Incomplete request body");
+    }
+
+    free(body);
+    request->_tempObject = nullptr;
+}
+
+void HttpMCPServer::handleJsonBody(AsyncWebServerRequest* request, const char* body) {
+    if (!validateOriginHeader(request)) {
+        sendJSONRPCError(request, 403, ErrorCode::INVALID_REQUEST, "Forbidden Origin");
+        return;
+    }
+
+    MCPRequest mcpReq = parseRequest(body);
 
     if (!validateProtocolVersionHeader(request, mcpReq)) {
         MCPResponse invalidVersion = createJSONRPCError(400, static_cast<int>(ErrorCode::INVALID_PARAMS), mcpReq.id(),

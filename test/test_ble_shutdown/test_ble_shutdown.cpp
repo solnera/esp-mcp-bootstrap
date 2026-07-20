@@ -468,6 +468,154 @@ void test_transport_retries_failed_notify(void) {
     TEST_ASSERT_EQUAL_INT(3, calls);
 }
 
+void test_disconnect_resets_transport_mtu(void) {
+    BLEMCPServer server("test-ble", "1.0.0");
+    server.begin();
+
+    auto& ble = McpBle::getInstance();
+    ble._onConnect(nullptr);
+    ble._onMtuChange(247);
+
+    /* Disconnect, then reconnect WITHOUT an MTU exchange: the transport must be
+     * back at the ATT default (23 → 20-byte payloads), not still framing for
+     * the previous connection's 247. */
+    ble._onDisconnect(nullptr);
+    ble._onConnect(nullptr);
+
+    mock_ble::resetNotifyTracking();
+    std::string msg(100, 'B');
+    mcp_transport_send_message(msg.c_str());
+
+    int packets = mock_ble::notifyCount().load();
+    size_t lastPacketSize = mock_ble::lastNotifyPayload().size();
+
+    ble._onDisconnect(nullptr);
+    server.end();
+
+    TEST_ASSERT_GREATER_THAN(1, packets);
+    TEST_ASSERT_LESS_OR_EQUAL(20, static_cast<int>(lastPacketSize));
+}
+
+void test_end_during_inflight_writes_is_safe(void) {
+    BLEMCPServer server("test-ble", "1.0.0");
+    server.begin();
+
+    auto& ble = McpBle::getInstance();
+    auto* nimServer = NimBLEDevice::createServer();
+    NimBLEConnInfo conn(7);
+    ble._onConnect(nimServer, conn);
+
+    std::atomic<bool> stopWriting(false);
+    std::atomic<int> writesDone(0);
+    NimBLECharacteristic characteristic;
+    /* Header 0x00 (SINGLE) + "{}": parses, has no method → the worker sends a
+     * parse-error response, so teardown races both the RX and TX paths. */
+    characteristic.setValue(std::vector<uint8_t>{0x00, '{', '}'});
+
+    std::thread writer([&] {
+        while (!stopWriting.load()) {
+            ble._onWrite(&characteristic, conn);
+            writesDone.fetch_add(1);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    });
+
+    const auto waitStart = std::chrono::steady_clock::now();
+    while (writesDone.load() < 5) {
+        TEST_ASSERT_LESS_THAN(1000, static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - waitStart).count()));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    /* Tear down while the host-task thread is still hammering writes. The
+     * callback setters must block until any in-flight write returns, so no
+     * write can touch freed transport state. */
+    server.end();
+
+    stopWriting.store(true);
+    writer.join();
+
+    /* After end() the write path must be inert: no callback, no response. */
+    mock_ble::resetNotifyTracking();
+    ble._onWrite(&characteristic, conn);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    TEST_ASSERT_EQUAL_INT(0, mock_ble::notifyCount().load());
+
+    /* Simulate the disconnect event that stop()'s disconnect() eventually
+     * produces, so the singleton is clean for the next test. */
+    ble._onDisconnect(nimServer, conn, 0);
+    TEST_ASSERT_FALSE(ble.isConnected());
+}
+
+void test_end_stops_advertising_and_disconnects_client(void) {
+    BLEMCPServer server("test-ble", "1.0.0");
+    server.begin();
+
+    auto& ble = McpBle::getInstance();
+    auto* nimServer = NimBLEDevice::createServer();
+    NimBLEConnInfo conn(7);
+    ble._onConnect(nimServer, conn);
+
+    mock_ble::resetConnectionTracking();
+    server.end();
+
+    int stops = mock_ble::stopAdvertisingCount().load();
+    int disconnects = mock_ble::disconnectCount().load();
+    int disconnectedHandle = mock_ble::lastDisconnectConnHandle().load();
+
+    /* The disconnect completes asynchronously on the host task; when the event
+     * lands after end(), advertising must NOT be restarted. */
+    mock_ble::resetConnectionTracking();
+    ble._onDisconnect(nimServer, conn, 0);
+    int restartsAfterEnd = mock_ble::startAdvertisingCount().load();
+
+    TEST_ASSERT_GREATER_OR_EQUAL(1, stops);
+    TEST_ASSERT_GREATER_OR_EQUAL(1, disconnects);
+    TEST_ASSERT_EQUAL_INT(7, disconnectedHandle);
+    TEST_ASSERT_EQUAL_INT(0, restartsAfterEnd);
+    TEST_ASSERT_FALSE(ble.isConnected());
+}
+
+void test_begin_after_end_restarts_advertising(void) {
+    BLEMCPServer server("test-ble", "1.0.0");
+    server.begin();
+
+    auto& ble = McpBle::getInstance();
+    auto* nimServer = NimBLEDevice::createServer();
+    NimBLEConnInfo conn(7);
+    ble._onConnect(nimServer, conn);
+
+    server.end();
+
+    /* Deferred disconnect after end(): must NOT re-advertise. */
+    mock_ble::resetConnectionTracking();
+    ble._onDisconnect(nimServer, conn, 0);
+    TEST_ASSERT_EQUAL_INT(0, mock_ble::startAdvertisingCount().load());
+
+    /* A central whose connection completes while stopped must be dropped. */
+    NimBLEConnInfo late(9);
+    bool accepted = ble._onConnect(nimServer, late);
+    TEST_ASSERT_FALSE(accepted);
+    TEST_ASSERT_GREATER_OR_EQUAL(1, mock_ble::disconnectCount().load());
+    TEST_ASSERT_EQUAL_INT(9, mock_ble::lastDisconnectConnHandle().load());
+
+    /* begin() again must resume advertising (deleting the _stopped reset would
+     * leave the device permanently undiscoverable)... */
+    mock_ble::resetConnectionTracking();
+    server.begin();
+    TEST_ASSERT_GREATER_OR_EQUAL(1, mock_ble::startAdvertisingCount().load());
+
+    /* ...and the normal disconnect → re-advertise cycle must work again. */
+    NimBLEConnInfo conn2(11);
+    TEST_ASSERT_TRUE(ble._onConnect(nimServer, conn2));
+    mock_ble::resetConnectionTracking();
+    ble._onDisconnect(nimServer, conn2, 0);
+    TEST_ASSERT_GREATER_OR_EQUAL(1, mock_ble::startAdvertisingCount().load());
+
+    server.end();
+    ble._onDisconnect(nimServer, conn2, 0);
+}
+
 void test_device_name_is_advertised(void) {
     /* NimBLE 2.x no longer advertises the device name automatically from
      * NimBLEDevice::init(); it must be set on the advertisement explicitly. */
@@ -496,6 +644,10 @@ int main(int argc, char** argv) {
     RUN_TEST(test_loop_does_not_consume_queue);
     RUN_TEST(test_failed_notify_is_reported);
     RUN_TEST(test_transport_retries_failed_notify);
+    RUN_TEST(test_disconnect_resets_transport_mtu);
+    RUN_TEST(test_end_during_inflight_writes_is_safe);
+    RUN_TEST(test_end_stops_advertising_and_disconnects_client);
+    RUN_TEST(test_begin_after_end_restarts_advertising);
     RUN_TEST(test_device_name_is_advertised);
     return UNITY_END();
 }

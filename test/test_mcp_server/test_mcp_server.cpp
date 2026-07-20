@@ -1,5 +1,6 @@
 #include <unity.h>
 #include <ArduinoJson.h>
+#include <cstring>
 #include "MCPServer.h"
 
 /* ======== Test Helpers ======== */
@@ -1085,6 +1086,120 @@ void test_parse_negative_id(void) {
     TEST_ASSERT_EQUAL(-1, req.id().as<int>());
 }
 
+/* ======== handle: ping ======== */
+
+void test_handle_ping_returns_empty_result(void) {
+    MCPRequest req = server->parseRequest(
+        R"({"jsonrpc":"2.0","id":7,"method":"ping"})");
+    MCPResponse res = server->handle(req);
+
+    TEST_ASSERT_EQUAL(200, res.code);
+    TEST_ASSERT_TRUE(res.hasResult());
+    TEST_ASSERT_FALSE(res.hasError());
+    TEST_ASSERT_EQUAL(7, res.id().as<int>());
+
+    /* The result must be an empty object, serialized as "result":{} */
+    std::string json = server->serializeResponse(res);
+    TEST_ASSERT_NOT_NULL(strstr(json.c_str(), "\"result\":{}"));
+}
+
+void test_handle_ping_notification_gets_no_response(void) {
+    MCPRequest req = server->parseRequest(
+        R"({"jsonrpc":"2.0","method":"ping"})");
+    MCPResponse res = server->handle(req);
+
+    TEST_ASSERT_FALSE(res.hasBody());
+    TEST_ASSERT_EQUAL_STRING("", server->serializeResponse(res).c_str());
+}
+
+/* ======== handle: protocol version 2025-06-18 ======== */
+
+void test_handle_initialize_negotiates_2025_06_18(void) {
+    MCPRequest req = server->parseRequest(
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})");
+    MCPResponse res = server->handle(req);
+
+    TEST_ASSERT_EQUAL(200, res.code);
+    TEST_ASSERT_EQUAL_STRING("2025-06-18", res.result()["protocolVersion"].as<const char*>());
+}
+
+/* ======== handle: invalid request vs parse error ======== */
+
+void test_valid_json_without_method_is_invalid_request(void) {
+    /* Structurally valid JSON that is not a JSON-RPC request must yield
+     * -32600 Invalid Request (with the id echoed), not -32700 Parse error. */
+    MCPRequest req = server->parseRequest(R"({"jsonrpc":"2.0","id":3})");
+    MCPResponse res = server->handle(req);
+
+    TEST_ASSERT_TRUE(res.hasError());
+    TEST_ASSERT_EQUAL(-32600, res.error()["code"].as<int>());
+    TEST_ASSERT_EQUAL(3, res.id().as<int>());
+}
+
+void test_empty_object_is_invalid_request_with_null_id(void) {
+    MCPRequest req = server->parseRequest("{}");
+    MCPResponse res = server->handle(req);
+
+    TEST_ASSERT_TRUE(res.hasError());
+    TEST_ASSERT_EQUAL(-32600, res.error()["code"].as<int>());
+    TEST_ASSERT_TRUE(res.id().isNull());
+}
+
+/* ======== handle: notification semantics ======== */
+
+class CountingHandler : public ToolHandler {
+public:
+    JsonDocument call(JsonVariantConst params) override {
+        (void)params;
+        calls++;
+        JsonDocument result;
+        result["ok"] = true;
+        return result;
+    }
+    int calls = 0;
+};
+
+void test_notification_tools_call_gets_no_response_and_is_not_executed(void) {
+    Tool tool;
+    tool.name = "counter";
+    tool.description = "Counts invocations";
+    tool.inputSchema.type = "object";
+    auto handler = std::make_shared<CountingHandler>();
+    tool.handler = handler;
+    server->RegisterTool(tool);
+
+    /* No id → notification. JSON-RPC 2.0 forbids any response; MCP clients
+     * never send tools/call as a notification, so it must not execute either. */
+    MCPRequest req = server->parseRequest(
+        R"({"jsonrpc":"2.0","method":"tools/call","params":{"name":"counter","arguments":{}}})");
+    MCPResponse res = server->handle(req);
+
+    TEST_ASSERT_FALSE(res.hasBody());
+    TEST_ASSERT_EQUAL_STRING("", server->serializeResponse(res).c_str());
+    TEST_ASSERT_EQUAL(0, handler->calls);
+}
+
+void test_notification_tools_list_gets_no_response(void) {
+    MCPRequest req = server->parseRequest(
+        R"({"jsonrpc":"2.0","method":"tools/list"})");
+    MCPResponse res = server->handle(req);
+
+    TEST_ASSERT_FALSE(res.hasBody());
+}
+
+void test_request_to_initialized_method_is_invalid_request(void) {
+    /* notifications/initialized carrying an id is malformed — it must yield a
+     * proper error object, not a body-less 202 or an empty response. */
+    MCPRequest req = server->parseRequest(
+        R"({"jsonrpc":"2.0","id":9,"method":"notifications/initialized"})");
+    MCPResponse res = server->handle(req);
+
+    TEST_ASSERT_TRUE(res.hasBody());
+    TEST_ASSERT_TRUE(res.hasError());
+    TEST_ASSERT_EQUAL(-32600, res.error()["code"].as<int>());
+    TEST_ASSERT_EQUAL(9, res.id().as<int>());
+}
+
 /* ======== Main ======== */
 
 int main(int argc, char** argv) {
@@ -1106,6 +1221,16 @@ int main(int argc, char** argv) {
 
     /* handle: notifications */
     RUN_TEST(test_handle_notifications_initialized);
+    RUN_TEST(test_notification_tools_call_gets_no_response_and_is_not_executed);
+    RUN_TEST(test_notification_tools_list_gets_no_response);
+    RUN_TEST(test_request_to_initialized_method_is_invalid_request);
+
+    /* handle: ping */
+    RUN_TEST(test_handle_ping_returns_empty_result);
+    RUN_TEST(test_handle_ping_notification_gets_no_response);
+
+    /* handle: protocol versions */
+    RUN_TEST(test_handle_initialize_negotiates_2025_06_18);
 
     /* handle: tools/list */
     RUN_TEST(test_handle_tools_list_empty);
@@ -1122,6 +1247,8 @@ int main(int argc, char** argv) {
     /* handle: errors */
     RUN_TEST(test_handle_unknown_method);
     RUN_TEST(test_handle_parse_error);
+    RUN_TEST(test_valid_json_without_method_is_invalid_request);
+    RUN_TEST(test_empty_object_is_invalid_request_with_null_id);
 
     /* serializeResponse */
     RUN_TEST(test_serialize_response_with_result);
