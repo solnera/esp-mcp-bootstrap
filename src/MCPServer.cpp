@@ -273,7 +273,8 @@ MCPResponse MCPServerBase::handleFunctionCalls(MCPRequest& request) {
     auto toolIt = tools.find(String(functionName));
     if (toolIt != tools.end()) {
         if (toolIt->second.handler) {
-            JsonDocument resultDoc = toolIt->second.handler->call(arguments);
+            bool toolError = false;
+            JsonDocument resultDoc = toolIt->second.handler->call(arguments, toolError);
 
             String resultText;
             serializeJson(resultDoc, resultText);
@@ -281,8 +282,12 @@ MCPResponse MCPServerBase::handleFunctionCalls(MCPRequest& request) {
             JsonObject textContent = content.add<JsonObject>();
             textContent["type"] = "text";
             textContent["text"] = resultText;
-            result["structuredContent"].set(resultDoc.as<JsonVariantConst>());
-            result["isError"] = false;
+            if (!toolError) {
+                /* An error payload would not conform to a declared outputSchema,
+                 * so structured content is only attached on success. */
+                result["structuredContent"].set(resultDoc.as<JsonVariantConst>());
+            }
+            result["isError"] = toolError;
             return mcpResponse;
         } else {
             return createJSONRPCError(200, static_cast<int>(ErrorCode::INTERNAL_ERROR), request.id(),

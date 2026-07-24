@@ -94,6 +94,17 @@ class ToolHandler {
    public:
     virtual ~ToolHandler() = default;
     virtual JsonDocument call(JsonVariantConst params) = 0;
+
+    /* Error-reporting variant; this is what the dispatcher invokes. The default
+     * runs call() and reports success, so existing single-method handlers keep
+     * working unchanged. To signal an execution failure (surfaced to the client
+     * as result.isError = true, per MCP), override BOTH overloads and set
+     * isError here; call(params) can simply delegate:
+     *   bool ignored; return call(params, ignored); */
+    virtual JsonDocument call(JsonVariantConst params, bool& isError) {
+        isError = false;
+        return call(params);
+    }
 };
 
 class Properties {
