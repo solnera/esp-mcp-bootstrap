@@ -282,9 +282,11 @@ MCPResponse MCPServerBase::handleFunctionCalls(MCPRequest& request) {
             JsonObject textContent = content.add<JsonObject>();
             textContent["type"] = "text";
             textContent["text"] = resultText;
-            if (!toolError) {
-                /* An error payload would not conform to a declared outputSchema,
-                 * so structured content is only attached on success. */
+            if (!toolError && resultDoc.is<JsonObjectConst>()) {
+                /* structuredContent is defined by MCP as a JSON object, and an
+                 * error payload would not conform to a declared outputSchema —
+                 * attach it only for successful object results. Non-object
+                 * results still reach the client as serialized text content. */
                 result["structuredContent"].set(resultDoc.as<JsonVariantConst>());
             }
             result["isError"] = toolError;
@@ -294,8 +296,10 @@ MCPResponse MCPServerBase::handleFunctionCalls(MCPRequest& request) {
                                       std::string("Tool handler not initialized: ") + functionName);
         }
     } else {
-        return createJSONRPCError(200, static_cast<int>(ErrorCode::METHOD_NOT_FOUND), request.id(),
-                                  std::string("Method not supported: ") + functionName);
+        /* Per MCP, an unknown tool is a -32602 invalid-params protocol error
+         * ("Unknown tool: ..."), not -32601 — the method (tools/call) exists. */
+        return createJSONRPCError(200, static_cast<int>(ErrorCode::INVALID_PARAMS), request.id(),
+                                  std::string("Unknown tool: ") + functionName);
     }
     return mcpResponse;
 }
