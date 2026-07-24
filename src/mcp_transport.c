@@ -322,7 +322,10 @@ void mcp_transport_receive(const uint8_t *data, size_t len) {
             return;
         }
 
-        rx_total_len = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3];
+        /* Assemble as uint32_t: uint8_t promotes to int, and a first byte >=
+         * 0x80 shifted left 24 would overflow the signed range (UB). */
+        rx_total_len = ((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
+                       ((uint32_t)payload[2] << 8) | (uint32_t)payload[3];
 
         if (rx_total_len > MAX_MESSAGE_SIZE) {
             mcp_transport_logf(MCP_TRANSPORT_LOG_ERROR, "Message too large: %d", (int)rx_total_len);
