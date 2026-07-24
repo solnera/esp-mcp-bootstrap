@@ -144,7 +144,7 @@ All MCP protocol logic (initialize, tools/list, tools/call, etc.) is implemented
 
 ### Common Types (MCPServer.h)
 
-- **`ToolHandler`** - Abstract base class. Override `JsonDocument call(JsonVariantConst params)` to implement tool logic.
+- **`ToolHandler`** - Abstract base class. Override `JsonDocument call(JsonVariantConst params)` to implement tool logic. To report a tool execution failure per MCP (`result.isError: true`), additionally override `JsonDocument call(JsonVariantConst params, bool& isError)`, set `isError = true`, and return a document describing the failure — it is serialized into the `content` text; `structuredContent` is omitted on error. Handlers that only implement the single-argument overload always report success, unchanged.
 - **`Tool`** - Tool definition with name, description, inputSchema, outputSchema, and handler.
 - **`Properties`** - JSON Schema builder for defining tool input/output schemas.
 - **`MCPRequest` / `MCPResponse`** - Internal protocol message types.

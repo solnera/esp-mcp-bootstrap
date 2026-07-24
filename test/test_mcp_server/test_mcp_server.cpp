@@ -48,6 +48,21 @@ public:
     }
 };
 
+class FailingHandler : public ToolHandler {
+public:
+    JsonDocument call(JsonVariantConst params) override {
+        bool ignored;
+        return call(params, ignored);
+    }
+    JsonDocument call(JsonVariantConst params, bool& isError) override {
+        (void)params;
+        isError = true;
+        JsonDocument result;
+        result["error"] = "sensor offline";
+        return result;
+    }
+};
+
 class ParamInspectHandler : public ToolHandler {
 public:
     JsonDocument call(JsonVariantConst params) override {
@@ -293,6 +308,36 @@ void test_handle_tool_call_success(void) {
     TEST_ASSERT_EQUAL_STRING("hello", textDoc["echo"].as<const char*>());
     TEST_ASSERT_EQUAL_STRING("hello", res.result()["structuredContent"]["echo"].as<const char*>());
     TEST_ASSERT_FALSE(res.result()["isError"].as<bool>());
+}
+
+void test_handle_tool_call_handler_reports_execution_error(void) {
+    Tool tool;
+    tool.name = "flaky";
+    tool.description = "Fails at runtime";
+    tool.inputSchema.type = "object";
+    tool.handler = std::make_shared<FailingHandler>();
+    server->RegisterTool(tool);
+
+    MCPRequest req = server->parseRequest(
+        R"({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"flaky","arguments":{}}})");
+    MCPResponse res = server->handle(req);
+
+    /* Per MCP, an execution failure is a RESULT with isError=true so the LLM
+     * can see it — not a JSON-RPC protocol error. */
+    TEST_ASSERT_EQUAL(200, res.code);
+    TEST_ASSERT_TRUE(res.hasResult());
+    TEST_ASSERT_FALSE(res.hasError());
+    TEST_ASSERT_TRUE(res.result()["isError"].as<bool>());
+
+    JsonArrayConst content = res.result()["content"].as<JsonArrayConst>();
+    TEST_ASSERT_EQUAL(1, content.size());
+    TEST_ASSERT_EQUAL_STRING("text", content[0]["type"].as<const char*>());
+    JsonDocument textDoc;
+    deserializeJson(textDoc, content[0]["text"].as<const char*>());
+    TEST_ASSERT_EQUAL_STRING("sensor offline", textDoc["error"].as<const char*>());
+
+    /* Error payloads would not conform to a declared outputSchema. */
+    TEST_ASSERT_TRUE(res.result()["structuredContent"].isNull());
 }
 
 void test_handle_tool_call_missing_name(void) {
@@ -1240,6 +1285,7 @@ int main(int argc, char** argv) {
 
     /* handle: tools/call */
     RUN_TEST(test_handle_tool_call_success);
+    RUN_TEST(test_handle_tool_call_handler_reports_execution_error);
     RUN_TEST(test_handle_tool_call_missing_name);
     RUN_TEST(test_handle_tool_call_unknown_tool);
     RUN_TEST(test_handle_tool_call_null_handler);
