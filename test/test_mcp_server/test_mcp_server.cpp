@@ -63,6 +63,16 @@ public:
     }
 };
 
+class ScalarHandler : public ToolHandler {
+public:
+    JsonDocument call(JsonVariantConst params) override {
+        (void)params;
+        JsonDocument result;
+        result.set(42);
+        return result;
+    }
+};
+
 class ParamInspectHandler : public ToolHandler {
 public:
     JsonDocument call(JsonVariantConst params) override {
@@ -340,6 +350,27 @@ void test_handle_tool_call_handler_reports_execution_error(void) {
     TEST_ASSERT_TRUE(res.result()["structuredContent"].isNull());
 }
 
+void test_handle_tool_call_scalar_result_has_no_structured_content(void) {
+    Tool tool;
+    tool.name = "scalar";
+    tool.description = "Returns a bare number";
+    tool.inputSchema.type = "object";
+    tool.handler = std::make_shared<ScalarHandler>();
+    server->RegisterTool(tool);
+
+    MCPRequest req = server->parseRequest(
+        R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"scalar","arguments":{}}})");
+    MCPResponse res = server->handle(req);
+
+    TEST_ASSERT_TRUE(res.hasResult());
+    TEST_ASSERT_FALSE(res.result()["isError"].as<bool>());
+    /* The value still reaches the client as serialized text content... */
+    TEST_ASSERT_EQUAL_STRING("42", res.result()["content"][0]["text"].as<const char*>());
+    /* ...but structuredContent is defined as a JSON object by MCP, so a
+     * non-object result must not be attached. */
+    TEST_ASSERT_TRUE(res.result()["structuredContent"].isNull());
+}
+
 void test_handle_tool_call_missing_name(void) {
     MCPRequest req = server->parseRequest(
         R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{}}})");
@@ -355,7 +386,10 @@ void test_handle_tool_call_unknown_tool(void) {
     MCPResponse res = server->handle(req);
 
     TEST_ASSERT_TRUE(res.hasError());
-    TEST_ASSERT_EQUAL(-32601, res.error()["code"].as<int>());
+    /* Per MCP, an unknown tool is -32602 invalid params, not -32601: the
+     * method (tools/call) itself exists. */
+    TEST_ASSERT_EQUAL(-32602, res.error()["code"].as<int>());
+    TEST_ASSERT_NOT_NULL(strstr(res.error()["message"].as<const char*>(), "Unknown tool: nonexistent"));
 }
 
 void test_handle_tool_call_null_handler(void) {
@@ -1286,6 +1320,7 @@ int main(int argc, char** argv) {
     /* handle: tools/call */
     RUN_TEST(test_handle_tool_call_success);
     RUN_TEST(test_handle_tool_call_handler_reports_execution_error);
+    RUN_TEST(test_handle_tool_call_scalar_result_has_no_structured_content);
     RUN_TEST(test_handle_tool_call_missing_name);
     RUN_TEST(test_handle_tool_call_unknown_tool);
     RUN_TEST(test_handle_tool_call_null_handler);
