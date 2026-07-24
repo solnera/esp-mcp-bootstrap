@@ -282,6 +282,24 @@ void test_receive_start_too_large(void) {
     assert_error_frame(EXPECT_ERR_MESSAGE_TOO_LARGE);
 }
 
+void test_receive_start_length_high_bit_rejected(void) {
+    /* First length byte >= 0x80 (declared total 0xFFFFFFFF) must be rejected
+     * as too large. Regression guard: the length used to be assembled with
+     * int-promoted shifts, so 0xFF << 24 shifted into the sign bit — UB that
+     * UBSan flags — before the size check ever ran. */
+    uint8_t pkt[6];
+    pkt[0] = 0x40;
+    pkt[1] = 0xFF;
+    pkt[2] = 0xFF;
+    pkt[3] = 0xFF;
+    pkt[4] = 0xFF;
+    pkt[5] = 'A';
+
+    mcp_transport_receive(pkt, sizeof(pkt));
+    TEST_ASSERT_FALSE(g_message_received);
+    assert_error_frame(EXPECT_ERR_MESSAGE_TOO_LARGE);
+}
+
 void test_receive_no_callback_no_crash(void) {
     mcp_transport_set_message_cb(NULL, NULL);
     uint8_t pkt[] = {0x00, 'h', 'i'};
@@ -949,6 +967,7 @@ int main(void) {
     RUN_TEST(test_receive_cont_without_start);
     RUN_TEST(test_receive_end_without_start);
     RUN_TEST(test_receive_start_too_large);
+    RUN_TEST(test_receive_start_length_high_bit_rejected);
     RUN_TEST(test_receive_no_callback_no_crash);
 
     /* Send */
