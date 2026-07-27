@@ -7,6 +7,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 namespace {
 
@@ -26,20 +27,154 @@ enum : uint8_t {
     BODY_NO_LENGTH = 2,
 };
 
+/* One deferred tools/call. Shared between the async_tcp task (the chunked
+ * response filler) and the worker task. Reference-counted intrusively and
+ * allocated with new (std::nothrow) so that running out of memory on the
+ * request path is a graceful HTTP 500 in BOTH exception modes — make_shared
+ * would abort the device under -fno-exceptions. One reference belongs to the
+ * queue/worker hand-off, one to the response filler; whichever drops last
+ * frees the job. */
+struct HttpToolJob {
+    MCPRequest request;
+    std::string response;  // serialized JSON-RPC; valid once done is set
+    std::atomic<bool> done{false};
+    std::atomic<int> refs{1};
+
+    static void release(HttpToolJob* job) {
+        if (job && job->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            delete job;
+        }
+    }
+};
+
+/* Copyable job handle for the filler std::function (which requires copyable
+ * captures): every copy owns one reference. */
+class JobRef {
+   public:
+    explicit JobRef(HttpToolJob* job) : job_(job) {}  // adopts an existing reference
+    JobRef(const JobRef& other) : job_(other.job_) {
+        if (job_) {
+            job_->refs.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    JobRef(JobRef&& other) noexcept : job_(other.job_) { other.job_ = nullptr; }
+    JobRef& operator=(const JobRef&) = delete;
+    ~JobRef() { HttpToolJob::release(job_); }
+    HttpToolJob* operator->() const { return job_; }
+
+   private:
+    HttpToolJob* job_;
+};
+
 }  // namespace
+
+#ifdef MCP_HTTP_TEST_HOOKS
+static int s_fail_next_job_alloc = 0;
+void mcp_http_test_fail_next_job_alloc(int n) {
+    s_fail_next_job_alloc = n;
+}
+#endif
 
 HttpMCPServer::HttpMCPServer(uint16_t port, const String& name, const String& version, const String& instructions)
     : MCPServerBase(name, version, instructions), port(port) {
+    // Best-effort: on failure tools/call degrades to inline execution.
+    startWorker();
     server = new AsyncWebServer(port);
     setupWebServer();
     setupMDNS();
 }
 
 HttpMCPServer::~HttpMCPServer() {
+    /* Delete the server first so async_tcp stops feeding job_queue, then join
+     * the worker. Like the AsyncWebServer it wraps, destruction is only safe
+     * once no request is in flight. */
     if (server) {
         delete server;
         server = nullptr;
     }
+    stopWorker();
+}
+
+bool HttpMCPServer::startWorker() {
+    job_queue = xQueueCreate(MCP_HTTP_JOB_QUEUE_DEPTH, sizeof(HttpToolJob*));
+    if (!job_queue) {
+        Serial.println("[MCP_HTTP] Failed to create job queue; tool calls run inline");
+        return false;
+    }
+    worker_done = xSemaphoreCreateBinary();
+    if (!worker_done) {
+        Serial.println("[MCP_HTTP] Failed to create worker semaphore; tool calls run inline");
+        vQueueDelete(job_queue);
+        job_queue = nullptr;
+        return false;
+    }
+    worker_exit.store(false, std::memory_order_relaxed);
+    if (xTaskCreate(HttpMCPServer::workerEntry, "mcp_http_worker", MCP_HTTP_WORKER_STACK_SIZE, this, 1,
+                    &worker_handle) != pdPASS) {
+        Serial.println("[MCP_HTTP] Failed to create worker task; tool calls run inline");
+        vSemaphoreDelete(worker_done);
+        worker_done = nullptr;
+        vQueueDelete(job_queue);
+        job_queue = nullptr;
+        worker_handle = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void HttpMCPServer::stopWorker() {
+    if (worker_handle) {
+        /* Same join protocol as the BLE worker: raise the flag, then wake the
+         * task. A 0-tick send into a full queue is fine — a full queue means
+         * the worker has work queued and re-checks worker_exit per dequeue. */
+        worker_exit.store(true, std::memory_order_release);
+        HttpToolJob* sentinel = nullptr;
+        if (job_queue) {
+            xQueueSend(job_queue, &sentinel, 0);
+        }
+        if (worker_done) {
+            xSemaphoreTake(worker_done, portMAX_DELAY);
+        }
+        worker_handle = nullptr;
+    }
+
+    if (job_queue) {
+        HttpToolJob* job = nullptr;
+        while (xQueueReceive(job_queue, &job, 0) == pdTRUE) {
+            HttpToolJob::release(job);  // undelivered job; any live response filler still owns its ref
+        }
+        vQueueDelete(job_queue);
+        job_queue = nullptr;
+    }
+
+    if (worker_done) {
+        vSemaphoreDelete(worker_done);
+        worker_done = nullptr;
+    }
+}
+
+void HttpMCPServer::workerEntry(void* ctx) {
+    auto* self = static_cast<HttpMCPServer*>(ctx);
+    HttpToolJob* job = nullptr;
+    for (;;) {
+        if (xQueueReceive(self->job_queue, &job, portMAX_DELAY) == pdTRUE) {
+            if (self->worker_exit.load(std::memory_order_acquire)) {
+                HttpToolJob::release(job);  // sentinel (null) or an undelivered job
+                break;
+            }
+            if (job) {
+                MCPResponse mcpResponse = self->handle(job->request);
+                job->response = self->serializeResponse(mcpResponse);
+                job->done.store(true, std::memory_order_release);
+                HttpToolJob::release(job);
+                job = nullptr;
+            }
+        }
+    }
+    if (self->worker_done) {
+        xSemaphoreGive(self->worker_done);
+    }
+    vTaskDelete(NULL);
 }
 
 void HttpMCPServer::setupWebServer() {
@@ -146,6 +281,10 @@ void HttpMCPServer::setupMDNS() {
     MDNS.addServiceTxt("_mcp", "_tcp", "usn", usn.c_str());
 }
 
+/* For transport-level rejections where no request id is known (pre-parse
+ * paths only) — the JSON-RPC id is null, as the spec requires when the id
+ * could not be detected. Once a request has been parsed, build the error
+ * with createJSONRPCError(request.id()) instead so the id is echoed. */
 void HttpMCPServer::sendJSONRPCError(AsyncWebServerRequest* request, int httpCode, ErrorCode rpcCode,
                                      const char* message) {
     JsonDocument nullId;
@@ -207,8 +346,98 @@ void HttpMCPServer::handleJsonBody(AsyncWebServerRequest* request, const char* b
         return;
     }
 
+    /* tools/call runs user code of unknown duration, so it executes on the
+     * worker task and is answered with a deferred chunked response. Everything
+     * else — protocol methods, notifications, malformed requests — is pure
+     * in-memory JSON work and stays inline. */
+    if (worker_handle && mcpReq.method == "tools/call" && !mcpReq.isNotification()) {
+        deferToolCall(request, std::move(mcpReq));
+        return;
+    }
+
     MCPResponse mcpRes = handle(mcpReq);
     sendMCPResponse(request, mcpRes);
+}
+
+void HttpMCPServer::deferToolCall(AsyncWebServerRequest* request, MCPRequest&& mcpRequest) {
+    /* Deferred responses rely on chunked framing, which needs HTTP/1.1. The
+     * pinned ESPAsyncWebServer 1.2.4 would cope with a version-0 request on
+     * its own — beginChunkedResponse (`if(_version)`, WebRequest.cpp) routes
+     * it to a non-chunked AsyncCallbackResponse whose body is close-delimited
+     * with no chunk framing (_chunked stays false) — but this library compiles
+     * against whichever fork __has_include finds, and that fallback differs
+     * across forks and is untested on hardware. Rejecting explicitly is safer
+     * than trusting it. Inline methods (initialize, tools/list, ping) still
+     * serve HTTP/1.0. */
+    if (request->version() == 0) {
+        MCPResponse unsupported =
+            createJSONRPCError(505, static_cast<int>(ErrorCode::SERVER_ERROR), mcpRequest.id(),
+                               "HTTP/1.1 required for deferred tool calls");
+        sendMCPResponse(request, unsupported);
+        return;
+    }
+
+    HttpToolJob* job = nullptr;
+#ifdef MCP_HTTP_TEST_HOOKS
+    if (s_fail_next_job_alloc > 0) {
+        s_fail_next_job_alloc--;
+    } else {
+        job = new (std::nothrow) HttpToolJob();
+    }
+#else
+    job = new (std::nothrow) HttpToolJob();
+#endif
+    if (!job) {
+        /* Graceful in both exception modes: a client hammering a device that
+         * is out of memory gets 500s, not reboots. The request is parsed by
+         * now, so echo its id — sendJSONRPCError is for pre-parse rejections
+         * and would answer id:null, which strict clients cannot correlate. */
+        MCPResponse oom = createJSONRPCError(500, static_cast<int>(ErrorCode::INTERNAL_ERROR), mcpRequest.id(),
+                                             "Out of memory");
+        sendMCPResponse(request, oom);
+        return;
+    }
+    job->request = std::move(mcpRequest);
+
+    job->refs.fetch_add(1, std::memory_order_relaxed);  // the queue/worker reference
+    if (xQueueSend(job_queue, &job, 0) != pdTRUE) {
+        HttpToolJob::release(job);  // the hand-off that never happened
+        /* Answer right away rather than queueing without bound. 200 + JSON-RPC
+         * error keeps the failure parseable by MCP SDKs (a bare 503 would
+         * surface as an opaque transport error). */
+        MCPResponse busy = createJSONRPCError(200, static_cast<int>(ErrorCode::SERVER_ERROR), job->request.id(),
+                                              "Server busy: tool call queue is full");
+        sendMCPResponse(request, busy);
+        HttpToolJob::release(job);  // the creator reference; frees the job
+        return;
+    }
+
+    /* The filler runs on the async_tcp task whenever the TCP window opens or
+     * the connection polls (~500 ms). It captures only the job — never `this` —
+     * so a response outliving the server cannot touch freed state. Returning
+     * RESPONSE_TRY_AGAIN until the worker finishes keeps the connection open
+     * without blocking; ESPAsyncWebServer already disables the 3 s RX idle
+     * timeout for the connection once send() is called. Returning 0 emits the
+     * terminating chunk. */
+    JobRef ref(job);  // adopts the creator reference
+    AsyncWebServerResponse* httpResponse = request->beginChunkedResponse(
+        "application/json", [ref](uint8_t* buffer, size_t maxLen, size_t index) -> size_t {
+            if (!ref->done.load(std::memory_order_acquire)) {
+                return RESPONSE_TRY_AGAIN;
+            }
+            const std::string& payload = ref->response;
+            if (index >= payload.size()) {
+                return 0;
+            }
+            size_t n = payload.size() - index;
+            if (n > maxLen) {
+                n = maxLen;
+            }
+            memcpy(buffer, payload.data() + index, n);
+            return n;
+        });
+    httpResponse->addHeader("MCP-Protocol-Version", PROTOCOL_VERSION);
+    request->send(httpResponse);
 }
 
 void HttpMCPServer::sendMCPResponse(AsyncWebServerRequest* request, const MCPResponse& response) {

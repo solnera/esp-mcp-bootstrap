@@ -9,6 +9,12 @@
  *  - Header lookup is case-insensitive.
  *  - Handlers are registered per (uri, method); tests fetch them via
  *    mock_async_web::lastServer() and drive body/request callbacks manually.
+ *  - Chunked/deferred responses mirror AsyncChunkedResponse: send() keeps the
+ *    response object alive and the filler is pulled via pumpChunked() (the
+ *    test-side stand-in for the ack/poll cycle) until it returns 0; a filler
+ *    returning RESPONSE_TRY_AGAIN sends nothing that round. The response
+ *    object — and the filler lambda with its captures — is destroyed on
+ *    completion (like _onAck) or with the request (like a disconnect).
  */
 
 #include "WString.h"
@@ -33,6 +39,12 @@ enum WebRequestMethod : int {
     HTTP_ANY = 0x7F,
 };
 
+// Same value as the real library; a filler returns it to mean "no data yet,
+// ask again on the next ack/poll cycle".
+#define RESPONSE_TRY_AGAIN 0xFFFFFFFF
+
+using AwsResponseFiller = std::function<size_t(uint8_t*, size_t, size_t)>;
+
 class AsyncWebServerRequest;
 
 class AsyncWebHeader {
@@ -49,6 +61,10 @@ public:
     AsyncWebServerResponse(int code, const String& contentType, const String& body)
         : code(code), contentType(contentType.c_str()), body(body.c_str()) {}
 
+    // Chunked variant; the real AsyncChunkedResponse hard-codes code 200.
+    AsyncWebServerResponse(const String& contentType, AwsResponseFiller filler)
+        : code(200), contentType(contentType.c_str()), filler(std::move(filler)) {}
+
     void addHeader(const String& name, const String& value) {
         headers[name.c_str()] = value.c_str();
     }
@@ -57,6 +73,7 @@ public:
     std::string contentType;
     std::string body;
     std::map<std::string, std::string> headers;
+    AwsResponseFiller filler;  // non-empty => chunked/deferred
 };
 
 class AsyncWebServerRequest {
@@ -67,11 +84,14 @@ public:
 
     ~AsyncWebServerRequest() {
         /* Mirrors ~AsyncWebServerRequest in the real library: _tempObject is
-         * released with free(), destructors are NOT run. */
+         * released with free(), destructors are NOT run, and a still-pending
+         * response is deleted with the request (the disconnect path). */
         if (_tempObject) {
             free(_tempObject);
             _tempObject = nullptr;
         }
+        delete _pendingResponse;
+        _pendingResponse = nullptr;
     }
 
     /* ---- API consumed by HttpMCPServer ---- */
@@ -89,8 +109,14 @@ public:
 
     const String& contentType() const { return contentType_; }
 
+    uint8_t version() const { return version_; }
+
     AsyncWebServerResponse* beginResponse(int code, const String& contentType, const String& body) {
         return new AsyncWebServerResponse(code, contentType, body);
+    }
+
+    AsyncWebServerResponse* beginChunkedResponse(const String& contentType, AwsResponseFiller callback) {
+        return new AsyncWebServerResponse(contentType, std::move(callback));
     }
 
     void send(int code) { record(code, "", "", {}); }
@@ -100,9 +126,45 @@ public:
     }
 
     void send(AsyncWebServerResponse* response) {
+        if (response->filler) {
+            /* Deferred: content arrives through the filler; tests pull it with
+             * pumpChunked(). Nothing is recorded until the terminating chunk. */
+            delete _pendingResponse;
+            _pendingResponse = response;
+            return;
+        }
         record(response->code, response->contentType, response->body, response->headers);
         delete response;
     }
+
+    /* One ack/poll cycle of AsyncChunkedResponse::_fillBuffer: invoke the
+     * filler once; TRY_AGAIN sends nothing, 0 is the terminating chunk (the
+     * response completes, is recorded, and is destroyed like in _onAck).
+     * Returns true once the response has completed. */
+    bool pumpChunked(size_t maxLen = 512) {
+        if (!_pendingResponse) {
+            return responseCount > 0;
+        }
+        uint8_t buffer[512];
+        if (maxLen > sizeof(buffer)) {
+            maxLen = sizeof(buffer);
+        }
+        size_t got = _pendingResponse->filler(buffer, maxLen, _chunkIndex);
+        if (got == RESPONSE_TRY_AGAIN) {
+            return false;
+        }
+        if (got == 0) {
+            record(_pendingResponse->code, _pendingResponse->contentType, _chunkBody, _pendingResponse->headers);
+            delete _pendingResponse;
+            _pendingResponse = nullptr;
+            return true;
+        }
+        _chunkBody.append(reinterpret_cast<char*>(buffer), got);
+        _chunkIndex += got;
+        return false;
+    }
+
+    bool hasPendingResponse() const { return _pendingResponse != nullptr; }
 
     void* _tempObject = nullptr;
 
@@ -115,6 +177,8 @@ public:
     void setContentLength(size_t length) { contentLength_ = length; }
 
     void setContentType(const char* type) { contentType_ = type; }
+
+    void setVersion(uint8_t version) { version_ = version; }
 
     int responseCount = 0;
     int lastCode = -1;
@@ -141,7 +205,11 @@ private:
 
     std::map<std::string, AsyncWebHeader> headers_;
     size_t contentLength_ = 0;
+    uint8_t version_ = 1;
     String contentType_ = String("application/json");
+    AsyncWebServerResponse* _pendingResponse = nullptr;
+    std::string _chunkBody;
+    size_t _chunkIndex = 0;
 };
 
 using ArRequestHandlerFunction = std::function<void(AsyncWebServerRequest*)>;
