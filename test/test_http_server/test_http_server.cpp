@@ -1,14 +1,19 @@
 #include <unity.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "HttpMCPServer.h"
 
 /* Drives the handlers HttpMCPServer registers on the mock AsyncWebServer the
  * way the real library does: body callback per chunk, then the onRequest
- * callback once the request is complete. */
+ * callback once the request is complete. tools/call answers arrive through a
+ * deferred chunked response; tests pull them with pumpChunked()/
+ * pumpUntilComplete(), the stand-in for the real ack/poll cycle. */
 
 namespace {
 
@@ -21,6 +26,25 @@ public:
     }
 };
 
+/* Blocks on the worker task until the test opens the gate; lets tests hold the
+ * worker busy at a known point. */
+std::atomic<bool> g_gate_open{false};
+std::atomic<bool> g_gate_entered{false};
+
+class GateHandler : public ToolHandler {
+public:
+    JsonDocument call(JsonVariantConst params) override {
+        (void)params;
+        g_gate_entered.store(true);
+        while (!g_gate_open.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        JsonDocument result;
+        result["gated"] = true;
+        return result;
+    }
+};
+
 struct TestServer {
     TestServer() : mcp(3000, "test-http", "1.0.0") {
         Tool tool;
@@ -29,6 +53,14 @@ struct TestServer {
         tool.inputSchema.type = "object";
         tool.handler = std::make_shared<EchoHandler>();
         mcp.RegisterTool(tool);
+
+        Tool gate;
+        gate.name = "gate";
+        gate.description = "Blocks until the test opens the gate";
+        gate.inputSchema.type = "object";
+        gate.handler = std::make_shared<GateHandler>();
+        mcp.RegisterTool(gate);
+
         web = mock_async_web::lastServer();
     }
 
@@ -56,9 +88,34 @@ void drivePost(TestServer& srv, AsyncWebServerRequest& req, const std::string& b
     route->onRequest(&req);
 }
 
+bool pumpUntilComplete(AsyncWebServerRequest& req, int timeoutMs = 2000) {
+    for (int waited = 0; waited <= timeoutMs; waited += 5) {
+        if (req.pumpChunked()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return req.pumpChunked();
+}
+
+bool waitForFlag(std::atomic<bool>& flag, int timeoutMs = 2000) {
+    for (int waited = 0; waited <= timeoutMs; waited += 1) {
+        if (flag.load()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return flag.load();
+}
+
+const char* kGateCall = R"({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"gate","arguments":{}}})";
+
 }  // namespace
 
-void setUp(void) {}
+void setUp(void) {
+    g_gate_open.store(false);
+    g_gate_entered.store(false);
+}
 void tearDown(void) {}
 
 void test_tools_list_roundtrip(void) {
@@ -81,9 +138,168 @@ void test_tool_call_roundtrip_chunked_body(void) {
               R"({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}})",
               7);
 
+    /* tools/call is answered via a deferred chunked response: nothing inline,
+     * the result arrives once the worker task has run the handler. */
+    TEST_ASSERT_EQUAL_INT(0, req.responseCount);
+    TEST_ASSERT_TRUE(req.hasPendingResponse());
+    TEST_ASSERT_TRUE(pumpUntilComplete(req));
     TEST_ASSERT_EQUAL_INT(1, req.responseCount);
     TEST_ASSERT_EQUAL_INT(200, req.lastCode);
     TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "\"hi\""));
+    TEST_ASSERT_EQUAL_STRING("application/json", req.lastContentType.c_str());
+    TEST_ASSERT_EQUAL_STRING("2025-11-25", req.lastHeaders["MCP-Protocol-Version"].c_str());
+}
+
+void test_tool_call_notification_stays_inline_202(void) {
+    /* A tools/call without an id is a notification: no execution, no body,
+     * answered 202 inline — it must not occupy the worker queue. */
+    TestServer srv;
+    AsyncWebServerRequest req;
+    drivePost(srv, req, R"({"jsonrpc":"2.0","method":"tools/call","params":{"name":"echo","arguments":{}}})");
+
+    TEST_ASSERT_EQUAL_INT(1, req.responseCount);
+    TEST_ASSERT_EQUAL_INT(202, req.lastCode);
+    TEST_ASSERT_FALSE(req.hasPendingResponse());
+    TEST_ASSERT_EQUAL_STRING("", req.lastBody.c_str());
+}
+
+void test_http_1_0_tool_call_is_rejected_without_chunk_framing(void) {
+    TestServer srv;
+    AsyncWebServerRequest req;
+    req.setVersion(0);
+    drivePost(srv, req,
+              R"({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"echo","arguments":{}}})");
+
+    TEST_ASSERT_EQUAL_INT(1, req.responseCount);
+    TEST_ASSERT_EQUAL_INT(505, req.lastCode);
+    TEST_ASSERT_FALSE(req.hasPendingResponse());
+    TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "\"id\":10"));
+    TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "HTTP/1.1 required"));
+}
+
+void test_tool_call_job_alloc_failure_returns_500_not_abort(void) {
+    /* OOM on the per-call job allocation must be a graceful inline 500 in
+     * both exception modes — never an abort/reboot. */
+    TestServer srv;
+    AsyncWebServerRequest req;
+    mcp_http_test_fail_next_job_alloc(1);
+    drivePost(srv, req,
+              R"({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"echo","arguments":{}}})");
+
+    TEST_ASSERT_EQUAL_INT(1, req.responseCount);
+    TEST_ASSERT_EQUAL_INT(500, req.lastCode);
+    TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "-32603"));
+    /* The request was parsed before the allocation failed, so the error must
+     * echo its id — not null — for clients to correlate it. */
+    TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "\"id\":11"));
+    TEST_ASSERT_FALSE(req.hasPendingResponse());
+
+    /* The failure is not sticky: the next call goes through. */
+    AsyncWebServerRequest req2;
+    drivePost(srv, req2,
+              R"({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"echo","arguments":{"text":"ok"}}})");
+    TEST_ASSERT_TRUE(pumpUntilComplete(req2));
+    TEST_ASSERT_EQUAL_INT(200, req2.lastCode);
+    TEST_ASSERT_NOT_NULL(strstr(req2.lastBody.c_str(), "\"ok\""));
+}
+
+void test_slow_tool_does_not_block_other_requests(void) {
+    /* The core property of the worker hand-off: while a handler blocks, the
+     * request path (async_tcp in production) keeps answering. */
+    TestServer srv;
+    AsyncWebServerRequest slowReq;
+    drivePost(srv, slowReq, kGateCall);
+    TEST_ASSERT_TRUE(waitForFlag(g_gate_entered));
+
+    AsyncWebServerRequest listReq;
+    drivePost(srv, listReq, R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
+    TEST_ASSERT_EQUAL_INT(1, listReq.responseCount);
+    TEST_ASSERT_EQUAL_INT(200, listReq.lastCode);
+    TEST_ASSERT_FALSE(slowReq.pumpChunked());  // still TRY_AGAIN while gated
+
+    g_gate_open.store(true);
+    TEST_ASSERT_TRUE(pumpUntilComplete(slowReq));
+    TEST_ASSERT_NOT_NULL(strstr(slowReq.lastBody.c_str(), "\"gated\":true"));
+    TEST_ASSERT_NOT_NULL(strstr(slowReq.lastBody.c_str(), "\"id\":5"));
+}
+
+void test_tool_call_queue_full_gets_busy_error(void) {
+    TestServer srv;
+    AsyncWebServerRequest gateReq;
+    drivePost(srv, gateReq, kGateCall);
+    /* Once the worker is inside the gated handler the queue is empty again;
+     * exactly MCP_HTTP_JOB_QUEUE_DEPTH more calls fit, the next must bounce. */
+    TEST_ASSERT_TRUE(waitForFlag(g_gate_entered));
+
+    AsyncWebServerRequest queued[MCP_HTTP_JOB_QUEUE_DEPTH];
+    for (auto& req : queued) {
+        drivePost(srv, req, R"({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"echo","arguments":{}}})");
+        TEST_ASSERT_EQUAL_INT(0, req.responseCount);
+        TEST_ASSERT_TRUE(req.hasPendingResponse());
+    }
+
+    AsyncWebServerRequest overflow;
+    drivePost(srv, overflow,
+              R"({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"echo","arguments":{}}})");
+    TEST_ASSERT_EQUAL_INT(1, overflow.responseCount);
+    TEST_ASSERT_EQUAL_INT(200, overflow.lastCode);
+    TEST_ASSERT_NOT_NULL(strstr(overflow.lastBody.c_str(), "-32000"));
+    TEST_ASSERT_NOT_NULL(strstr(overflow.lastBody.c_str(), "\"id\":9"));
+
+    g_gate_open.store(true);
+    TEST_ASSERT_TRUE(pumpUntilComplete(gateReq));
+    for (auto& req : queued) {
+        TEST_ASSERT_TRUE(pumpUntilComplete(req));
+        TEST_ASSERT_EQUAL_INT(200, req.lastCode);
+    }
+}
+
+void test_client_abort_discards_result_without_crash(void) {
+    /* The client disconnects while its tool is still executing. Execution is
+     * deliberately NOT cancelled (tools have side effects); the result is
+     * discarded when the worker drops the last job reference. ASan verifies
+     * the lifetime handling. */
+    TestServer srv;
+    {
+        AsyncWebServerRequest req;
+        drivePost(srv, req, kGateCall);
+        TEST_ASSERT_TRUE(waitForFlag(g_gate_entered));
+        TEST_ASSERT_TRUE(req.hasPendingResponse());
+    }  // request dies mid-call, like a TCP disconnect
+    g_gate_open.store(true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    TEST_ASSERT_TRUE(true);  // reaching here without ASan errors is the assertion
+}
+
+void test_server_teardown_with_inflight_job(void) {
+    /* Destroying the server while one job executes and another is queued must
+     * join the worker cleanly: the executing job finishes, the queued one is
+     * discarded undelivered. */
+    AsyncWebServerRequest gateReq;
+    AsyncWebServerRequest queuedReq;
+    std::thread releaser;
+    {
+        TestServer srv;
+        drivePost(srv, gateReq, kGateCall);
+        TEST_ASSERT_TRUE(waitForFlag(g_gate_entered));
+        drivePost(srv, queuedReq,
+                  R"({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"echo","arguments":{}}})");
+        TEST_ASSERT_EQUAL_INT(0, queuedReq.responseCount);
+
+        releaser = std::thread([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            g_gate_open.store(true);
+        });
+    }  // ~HttpMCPServer blocks here until the worker has exited
+    releaser.join();
+
+    /* The gated job completed before the worker exited, so its response is
+     * still deliverable — the filler owns the job, not the server. The queued
+     * job was discarded: its response stays pending forever. */
+    TEST_ASSERT_TRUE(pumpUntilComplete(gateReq));
+    TEST_ASSERT_NOT_NULL(strstr(gateReq.lastBody.c_str(), "\"gated\":true"));
+    TEST_ASSERT_FALSE(queuedReq.pumpChunked());
+    TEST_ASSERT_TRUE(queuedReq.hasPendingResponse());
 }
 
 void test_empty_body_post_gets_parse_error_response(void) {
@@ -279,6 +495,13 @@ int main(int argc, char** argv) {
     UNITY_BEGIN();
     RUN_TEST(test_tools_list_roundtrip);
     RUN_TEST(test_tool_call_roundtrip_chunked_body);
+    RUN_TEST(test_tool_call_notification_stays_inline_202);
+    RUN_TEST(test_http_1_0_tool_call_is_rejected_without_chunk_framing);
+    RUN_TEST(test_tool_call_job_alloc_failure_returns_500_not_abort);
+    RUN_TEST(test_slow_tool_does_not_block_other_requests);
+    RUN_TEST(test_tool_call_queue_full_gets_busy_error);
+    RUN_TEST(test_client_abort_discards_result_without_crash);
+    RUN_TEST(test_server_teardown_with_inflight_job);
     RUN_TEST(test_empty_body_post_gets_parse_error_response);
     RUN_TEST(test_oversized_body_is_rejected_with_413);
     RUN_TEST(test_chunked_upload_without_length_gets_411);

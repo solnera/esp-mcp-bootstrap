@@ -5,7 +5,7 @@ Unified MCP (Model Context Protocol) Server library for ESP32. Supports both **H
 ## Features
 
 - **Unified API** - Common data structures (`Tool`, `ToolHandler`, `Properties`, etc.) shared across transports
-- **HTTP transport** - MCP over HTTP/JSON-RPC using ESPAsyncWebServer
+- **HTTP transport** - MCP over HTTP/JSON-RPC using ESPAsyncWebServer; tool calls run on a worker task, so handlers may block
 - **BLE transport** - MCP over Bluetooth Low Energy with automatic message fragmentation
 - **Dual transport** - Use both HTTP and BLE simultaneously in a single project
 - **Conditional compilation** - Only the transports whose dependencies are present get compiled
@@ -153,7 +153,10 @@ All MCP protocol logic (initialize, tools/list, tools/call, etc.) is implemented
 ### HttpMCPServer
 
 - **`HttpMCPServer(port, name, version, instructions)`** - Constructor. Starts HTTP server immediately. This lightweight transport returns JSON responses over POST and responds `405` to GET because server-to-client SSE streams are not implemented.
-- **`RegisterTool(tool)`** - Register an MCP tool.
+- **`RegisterTool(tool)`** - Register an MCP tool. Register all tools before serving traffic; `RegisterTool` is not synchronized against in-flight requests.
+- **Tool execution model** - `tools/call` runs on a dedicated worker task (stack `-DMCP_HTTP_WORKER_STACK_SIZE=<bytes>`, default `8192`), so handlers may block — sensor waits, `delay()`, outbound HTTP calls — without starving the `async_tcp` task or tripping the task watchdog. The result is delivered as a chunked response (`Transfer-Encoding: chunked`), which HTTP/1.1 libraries decode transparently; HTTP/1.0 `tools/call` requests are rejected with `505 HTTP Version Not Supported`. `initialize`, `tools/list`, `ping`, notifications, and every transport-level rejection are still answered inline — those are pure in-memory JSON work. If the worker task cannot be created (out of memory at construction), `tools/call` degrades to inline execution and a log line reports it; handlers must then return quickly.
+- Pending tool calls are bounded (`-DMCP_HTTP_JOB_QUEUE_DEPTH=<n>`, default `4`); when the queue is full the server immediately answers JSON-RPC error `-32000` ("Server busy") so clients can back off and retry. Tool calls execute one at a time, in arrival order. A per-call job allocation that fails under memory pressure is answered with JSON-RPC `-32603` (HTTP `500`) instead of aborting, in both exception modes; allocations made while a handler runs (JSON documents, the serialized result) keep the library-wide fail-fast policy.
+- A client disconnect does not cancel a running tool: execution always completes — tools have side effects (a WiFi-reconfig tool must finish even though reconfiguring drops the link) — and the result is discarded if nobody is left to read it. Slow tools are bounded by the client's HTTP timeout, not by the server.
 - POST bodies are capped at `8192` bytes (`-DMCP_HTTP_MAX_BODY_SIZE=<bytes>`); larger requests are rejected with HTTP `413` before any buffering, so a hostile Content-Length cannot exhaust the heap. Non-JSON content types get `415`. A request without a usable Content-Length is answered `411` as a defensive fallback (ESPAsyncWebServer 1.2.x does not support chunked request bodies).
 - JSON-RPC notifications receive `202 Accepted` with no body, per the MCP Streamable HTTP transport.
 
