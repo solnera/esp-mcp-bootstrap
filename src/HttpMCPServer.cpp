@@ -6,6 +6,7 @@
 #include <esp_system.h>
 
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <new>
 
@@ -26,6 +27,23 @@ enum : uint8_t {
     BODY_TOO_LARGE = 1,
     BODY_NO_LENGTH = 2,
 };
+
+bool isJsonContentType(const String& value) {
+    static const char expected[] = "application/json";
+    const char* cursor = value.c_str();
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) {
+        ++cursor;
+    }
+    for (size_t i = 0; expected[i] != '\0'; ++i, ++cursor) {
+        if (std::tolower(static_cast<unsigned char>(*cursor)) != expected[i]) {
+            return false;
+        }
+    }
+    while (*cursor != '\0' && std::isspace(static_cast<unsigned char>(*cursor))) {
+        ++cursor;
+    }
+    return *cursor == '\0' || *cursor == ';';
+}
 
 /* One deferred tools/call. Shared between the async_tcp task (the chunked
  * response filler) and the worker task. Reference-counted intrusively and
@@ -77,11 +95,7 @@ void mcp_http_test_fail_next_job_alloc(int n) {
 
 HttpMCPServer::HttpMCPServer(uint16_t port, const String& name, const String& version, const String& instructions)
     : MCPServerBase(name, version, instructions), port(port) {
-    // Best-effort: on failure tools/call degrades to inline execution.
-    startWorker();
     server = new AsyncWebServer(port);
-    setupWebServer();
-    setupMDNS();
 }
 
 HttpMCPServer::~HttpMCPServer() {
@@ -93,6 +107,22 @@ HttpMCPServer::~HttpMCPServer() {
         server = nullptr;
     }
     stopWorker();
+}
+
+bool HttpMCPServer::begin() {
+    if (started) {
+        return true;
+    }
+    if (!server) {
+        return false;
+    }
+
+    // Best-effort: on failure tools/call degrades to inline execution.
+    startWorker();
+    setupWebServer();
+    setupMDNS();
+    started = true;
+    return true;
 }
 
 bool HttpMCPServer::startWorker() {
@@ -296,21 +326,23 @@ void HttpMCPServer::sendJSONRPCError(AsyncWebServerRequest* request, int httpCod
 void HttpMCPServer::handlePostComplete(AsyncWebServerRequest* request) {
     BodyBuffer* body = static_cast<BodyBuffer*>(request->_tempObject);
 
+    if (!isJsonContentType(request->contentType())) {
+        if (body) {
+            free(body);
+            request->_tempObject = nullptr;
+        }
+        sendJSONRPCError(request, 415, ErrorCode::INVALID_REQUEST, "Content-Type must be application/json");
+        return;
+    }
+
     if (!body) {
         if (request->contentLength() == 0) {
             // No body at all; let the parser produce the JSON-RPC parse error.
             handleJsonBody(request, "");
             return;
         }
-        const String& contentType = request->contentType();
-        if (contentType.length() > 0 && !contentType.startsWith("application/json")) {
-            /* ESPAsyncWebServer consumes urlencoded/multipart bodies itself and
-             * never invokes our body callback — not an allocation failure. */
-            sendJSONRPCError(request, 415, ErrorCode::INVALID_REQUEST, "Content-Type must be application/json");
-        } else {
-            // The body callback could not allocate the accumulation buffer.
-            sendJSONRPCError(request, 500, ErrorCode::INTERNAL_ERROR, "Out of memory");
-        }
+        // The body callback could not allocate the accumulation buffer.
+        sendJSONRPCError(request, 500, ErrorCode::INTERNAL_ERROR, "Out of memory");
         return;
     }
 

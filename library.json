@@ -1,6 +1,6 @@
 {
     "name": "ESP-MCP",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": "Model Context Protocol server for ESP32. Expose Arduino-side tools to LLM clients over HTTP/JSON-RPC, BLE, or both through a single Tool/ToolHandler API; each transport is compiled in only when its dependencies are present.",
     "keywords": [
         "mcp",

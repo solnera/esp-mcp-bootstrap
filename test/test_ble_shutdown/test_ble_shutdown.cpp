@@ -376,6 +376,51 @@ void test_rx_queue_overflow_is_counted_not_silent(void) {
     TEST_ASSERT_EQUAL_UINT8(EXPECT_ERR_BUSY, lastNotify[2]);
 }
 
+void test_rx_queue_enforces_aggregate_byte_budget(void) {
+    std::atomic<bool> started(false);
+    std::atomic<bool> release(false);
+
+    BLEMCPServer server("test-ble", "1.0.0");
+    Tool tool;
+    tool.name = "block";
+    tool.inputSchema.type = "object";
+    tool.handler = std::make_shared<BlockingHandler>(started, release);
+    server.RegisterTool(tool);
+    server.begin();
+    McpBle::getInstance()._onConnect(nullptr);
+
+    sendSingleMessage(
+        R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"block","arguments":{}}})");
+    const auto waitStart = std::chrono::steady_clock::now();
+    while (!started.load()) {
+        TEST_ASSERT_LESS_THAN(500, static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now() - waitStart).count()));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    std::string large =
+        R"({"jsonrpc":"2.0","id":2,"method":"ping","params":{"padding":")";
+    large.append(7000, 'x');
+    large += R"("}})";
+
+    mock_ble::resetNotifyTracking();
+    sendSingleMessage(large.c_str());
+    sendSingleMessage(large.c_str());
+    sendSingleMessage(large.c_str());
+
+    TEST_ASSERT_LESS_OR_EQUAL(MCP_BLE_RX_QUEUE_MAX_BYTES,
+                              static_cast<int>(server.queuedMessageBytes()));
+    TEST_ASSERT_GREATER_OR_EQUAL(1, static_cast<int>(server.droppedMessageCount()));
+    std::vector<uint8_t> lastNotify = mock_ble::lastNotifyPayload();
+    TEST_ASSERT_GREATER_OR_EQUAL(3, static_cast<int>(lastNotify.size()));
+    TEST_ASSERT_EQUAL_UINT8(EXPECT_ERR_BUSY, lastNotify[2]);
+
+    release.store(true);
+    McpBle::getInstance()._onDisconnect(nullptr);
+    server.end();
+    TEST_ASSERT_EQUAL_INT(0, static_cast<int>(server.queuedMessageBytes()));
+}
+
 void test_loop_does_not_consume_queue(void) {
     std::atomic<bool> started(false);
     std::atomic<bool> release(false);
@@ -641,6 +686,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_notifications_target_active_connection);
     RUN_TEST(test_disconnect_discards_partial_message);
     RUN_TEST(test_rx_queue_overflow_is_counted_not_silent);
+    RUN_TEST(test_rx_queue_enforces_aggregate_byte_budget);
     RUN_TEST(test_loop_does_not_consume_queue);
     RUN_TEST(test_failed_notify_is_reported);
     RUN_TEST(test_transport_retries_failed_notify);

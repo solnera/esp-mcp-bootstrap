@@ -5,17 +5,27 @@
 
 #include "MCPServer.h"
 #include "McpBle.h"
+#include "mcp_transport.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include <atomic>
+
 // Depth of the RX hand-off queue between the BLE write callback and the worker
 // task. A full queue means requests are arriving faster than they are handled;
 // overflow is counted (see droppedMessageCount) rather than dropped silently.
 #ifndef MCP_BLE_RX_QUEUE_DEPTH
 #define MCP_BLE_RX_QUEUE_DEPTH 16
+#endif
+
+// Aggregate heap budget for complete messages waiting in the BLE worker queue.
+// This is independent of queue depth so a burst of maximum-size messages cannot
+// consume most of an ESP32's heap. Small messages can still use the full queue.
+#ifndef MCP_BLE_RX_QUEUE_MAX_BYTES
+#define MCP_BLE_RX_QUEUE_MAX_BYTES (MCP_TRANSPORT_MAX_MESSAGE_SIZE * 2)
 #endif
 
 class BLEMCPServer : public MCPServerBase {
@@ -35,7 +45,8 @@ class BLEMCPServer : public MCPServerBase {
 
     // Number of inbound messages dropped because the RX queue was full.
     // Non-zero means the peer is sending faster than handlers can keep up.
-    uint32_t droppedMessageCount() const { return rx_dropped; }
+    uint32_t droppedMessageCount() const { return rx_dropped.load(std::memory_order_relaxed); }
+    size_t queuedMessageBytes() const { return rx_queued_bytes.load(std::memory_order_relaxed); }
 
    private:
     static void onMessage(const char* message, void* ctx);
@@ -53,8 +64,9 @@ class BLEMCPServer : public MCPServerBase {
     TaskHandle_t task_handle = nullptr;
     SemaphoreHandle_t task_done = nullptr;
     SemaphoreHandle_t send_mutex = nullptr;
-    volatile bool exit_flag = false;
-    volatile uint32_t rx_dropped = 0;
+    std::atomic<bool> exit_flag{false};
+    std::atomic<uint32_t> rx_dropped{0};
+    std::atomic<size_t> rx_queued_bytes{0};
 
     static BLEMCPServer* s_bound;
     static bool s_initialized;

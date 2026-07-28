@@ -3,6 +3,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#ifndef MCP_TRANSPORT_MAX_MESSAGE_SIZE
+#define MCP_TRANSPORT_MAX_MESSAGE_SIZE 8192
+#endif
+
 /*
  * Build-time configuration:
  *   -DMCP_TRANSPORT_MAX_MESSAGE_SIZE=<bytes>

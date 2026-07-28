@@ -7,6 +7,27 @@
 
 #define TAG "MCP_SERVER"
 
+namespace {
+
+bool reserveQueuedBytes(std::atomic<size_t>& queued, size_t bytes) {
+    size_t current = queued.load(std::memory_order_relaxed);
+    while (bytes <= MCP_BLE_RX_QUEUE_MAX_BYTES &&
+           current <= MCP_BLE_RX_QUEUE_MAX_BYTES - bytes) {
+        if (queued.compare_exchange_weak(current, current + bytes,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void releaseQueuedBytes(std::atomic<size_t>& queued, size_t bytes) {
+    queued.fetch_sub(bytes, std::memory_order_acq_rel);
+}
+
+}  // namespace
+
 BLEMCPServer* BLEMCPServer::s_bound = nullptr;
 bool BLEMCPServer::s_initialized = false;
 
@@ -33,14 +54,14 @@ void BLEMCPServer::begin() {
     }
     s_bound = this;
 
-    exit_flag = false;
+    exit_flag.store(false, std::memory_order_release);
 
     if (!rx_queue) {
         rx_queue = xQueueCreate(MCP_BLE_RX_QUEUE_DEPTH, sizeof(char*));
         if (!rx_queue) {
             Serial.println("[MCP_SERVER] Failed to create BLE RX queue");
             s_bound = nullptr;
-            exit_flag = true;
+            exit_flag.store(true, std::memory_order_release);
             return;
         }
     }
@@ -51,7 +72,7 @@ void BLEMCPServer::begin() {
             vQueueDelete(rx_queue);
             rx_queue = nullptr;
             s_bound = nullptr;
-            exit_flag = true;
+            exit_flag.store(true, std::memory_order_release);
             return;
         }
     }
@@ -64,7 +85,7 @@ void BLEMCPServer::begin() {
             vQueueDelete(rx_queue);
             rx_queue = nullptr;
             s_bound = nullptr;
-            exit_flag = true;
+            exit_flag.store(true, std::memory_order_release);
             return;
         }
     }
@@ -78,7 +99,7 @@ void BLEMCPServer::begin() {
             vQueueDelete(rx_queue);
             rx_queue = nullptr;
             s_bound = nullptr;
-            exit_flag = true;
+            exit_flag.store(true, std::memory_order_release);
             return;
         }
     }
@@ -135,7 +156,7 @@ void BLEMCPServer::end() {
      *    longer be inside the transport.
      * 3. Only then delete the FreeRTOS objects and free the transport buffers. */
     if (task_handle) {
-        exit_flag = true;
+        exit_flag.store(true, std::memory_order_release);
         char* sentinel = nullptr;
         if (rx_queue) {
             xQueueSend(rx_queue, &sentinel, 0);
@@ -159,7 +180,9 @@ void BLEMCPServer::end() {
         char* msg = nullptr;
         while (xQueueReceive(rx_queue, &msg, 0) == pdTRUE) {
             if (msg) {
+                const size_t bytes = strlen(msg) + 1;
                 free(msg);
+                releaseQueuedBytes(rx_queued_bytes, bytes);
                 msg = nullptr;
             }
         }
@@ -196,13 +219,19 @@ void BLEMCPServer::taskEntry(void* ctx) {
     char* msg = nullptr;
     for (;;) {
         if (xQueueReceive(self->rx_queue, &msg, portMAX_DELAY) == pdTRUE) {
-            if (self->exit_flag) {
-                if (msg) free(msg);
+            if (self->exit_flag.load(std::memory_order_acquire)) {
+                if (msg) {
+                    const size_t bytes = strlen(msg) + 1;
+                    free(msg);
+                    releaseQueuedBytes(self->rx_queued_bytes, bytes);
+                }
                 break;
             }
             if (msg) {
+                const size_t bytes = strlen(msg) + 1;
                 self->processMessage(msg);
                 free(msg);
+                releaseQueuedBytes(self->rx_queued_bytes, bytes);
                 msg = nullptr;
             }
         }
@@ -216,18 +245,32 @@ void BLEMCPServer::taskEntry(void* ctx) {
 void BLEMCPServer::onMessage(const char* message, void* ctx) {
     if (!ctx) return;
     auto* self = static_cast<BLEMCPServer*>(ctx);
-    if (self->exit_flag) return;
+    if (self->exit_flag.load(std::memory_order_acquire)) return;
     if (!self->rx_queue || !message) return;
     size_t n = strlen(message);
+    const size_t allocationBytes = n + 1;
+    if (!reserveQueuedBytes(self->rx_queued_bytes, allocationBytes)) {
+        const uint32_t dropped = self->rx_dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+        Serial.printf("[MCP_SERVER] RX byte budget exhausted, dropped message (total dropped: %u)\n",
+                      (unsigned)dropped);
+        mcp_transport_send_error(MCP_TRANSPORT_ERR_BUSY, "rx byte budget");
+        return;
+    }
     char* copy = (char*)malloc(n + 1);
-    if (!copy) return;
+    if (!copy) {
+        releaseQueuedBytes(self->rx_queued_bytes, allocationBytes);
+        self->rx_dropped.fetch_add(1, std::memory_order_relaxed);
+        mcp_transport_send_error(MCP_TRANSPORT_ERR_OOM, "rx queue oom");
+        return;
+    }
     memcpy(copy, message, n);
     copy[n] = '\0';
     if (xQueueSend(self->rx_queue, &copy, 0) != pdTRUE) {
         free(copy);
-        self->rx_dropped++;
+        releaseQueuedBytes(self->rx_queued_bytes, allocationBytes);
+        const uint32_t dropped = self->rx_dropped.fetch_add(1, std::memory_order_relaxed) + 1;
         Serial.printf("[MCP_SERVER] RX queue full, dropped message (total dropped: %u)\n",
-                      (unsigned)self->rx_dropped);
+                      (unsigned)dropped);
         mcp_transport_send_error(MCP_TRANSPORT_ERR_BUSY, "rx queue full");
     }
 }

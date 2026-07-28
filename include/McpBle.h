@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include <atomic>
 #include <functional>
 #include <string>
 
@@ -80,11 +81,10 @@ private:
     RxCallback _rxCallback;
     MtuCallback _mtuCallback;
     DisconnectCallback _disconnectCallback;
-    uint16_t _mtu = 23;
-    bool _connected = false;
-    uint16_t _activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
+    std::atomic<uint16_t> _mtu{23};
+    std::atomic<uint16_t> _activeConnHandle{BLE_HS_CONN_HANDLE_NONE};
     bool _initialized = false;
-    bool _stopped = false;
+    std::atomic<bool> _stopped{false};
 
     // Serializes callback invocation (NimBLE host task) against callback
     // reassignment (user task), so teardown can quiesce the host task before

@@ -59,6 +59,7 @@ class ConfigWifiHandler : public ToolHandler {
                 httpServer = new HttpMCPServer(MCP_PORT, "ESP32-MCP-HTTP", "1.0.0",
                                                "Dual transport MCP server");
                 httpServer->RegisterTool(echoTool);
+                httpServer->begin();
                 Serial.printf("HTTP MCP Server started at http://%s:%d/mcp\n",
                               ipStr.c_str(), MCP_PORT);
             }

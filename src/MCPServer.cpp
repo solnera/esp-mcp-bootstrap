@@ -22,7 +22,11 @@ String Properties::toString() const {
 }
 
 void Properties::toJson(JsonObject& obj) const {
-    obj["type"] = type;
+    // An omitted type is a valid unconstrained JSON Schema. Emitting an empty
+    // string produces an invalid schema and breaks tools that forgot to set it.
+    if (type.length() > 0) {
+        obj["type"] = type;
+    }
 
     if (title.length() > 0) {
         obj["title"] = title;
@@ -138,15 +142,39 @@ MCPRequest MCPServerBase::parseRequest(const std::string& json) {
         return request;
     }
 
+    if (!doc.is<JsonObjectConst>()) {
+        request.invalidRequest = true;
+        return request;
+    }
+
     JsonObjectConst root = doc.as<JsonObjectConst>();
-    /* JSON-RPC requires method to be a string. as<std::string>() must not be
-     * used here: on a missing/non-string member it serializes the value,
-     * turning an absent method into the literal string "null". */
+    JsonVariantConst versionVar = root["jsonrpc"];
     JsonVariantConst methodVar = root["method"];
-    request.method = methodVar.is<const char*>() ? methodVar.as<const char*>() : "";
-    request.hasIdField = !root["id"].isUnbound();
-    request.idDoc.set(root["id"]);
-    request.paramsDoc.set(root["params"]);
+    JsonVariantConst idVar = root["id"];
+    JsonVariantConst paramsVar = root["params"];
+
+    request.hasIdField = !idVar.isUnbound();
+    if (request.hasIdField &&
+        !(idVar.isNull() || idVar.is<const char*>() || idVar.is<int64_t>() || idVar.is<uint64_t>())) {
+        request.invalidRequest = true;
+        request.hasIdField = false;  // invalid ids must be answered as id:null
+        return request;
+    }
+    request.idDoc.set(idVar);
+
+    if (!versionVar.is<const char*>() || strcmp(versionVar.as<const char*>(), "2.0") != 0 ||
+        !methodVar.is<const char*>()) {
+        request.invalidRequest = true;
+        return request;
+    }
+
+    if (!paramsVar.isUnbound() && !(paramsVar.is<JsonObjectConst>() || paramsVar.is<JsonArrayConst>())) {
+        request.invalidRequest = true;
+        return request;
+    }
+
+    request.method = methodVar.as<const char*>();
+    request.paramsDoc.set(paramsVar);
     return request;
 }
 
@@ -176,10 +204,9 @@ MCPResponse MCPServerBase::handle(MCPRequest& request) {
         return createJSONRPCError(400, static_cast<int>(ErrorCode::PARSE_ERROR), request.id(), "Parse error: Invalid JSON");
     }
 
-    if (request.method.empty()) {
-        // Syntactically valid JSON that is not a JSON-RPC request (no method).
+    if (request.invalidRequest || request.method.empty()) {
         return createJSONRPCError(400, static_cast<int>(ErrorCode::INVALID_REQUEST), request.id(),
-                                  "Invalid Request: missing method");
+                                  "Invalid Request");
     }
 
     if (request.isNotification()) {
@@ -208,6 +235,15 @@ MCPResponse MCPServerBase::handle(MCPRequest& request) {
 }
 
 MCPResponse MCPServerBase::handleInitialize(MCPRequest& request) {
+    JsonVariantConst params = request.params();
+    if (!params.is<JsonObjectConst>() || !params["protocolVersion"].is<const char*>() ||
+        !params["capabilities"].is<JsonObjectConst>() || !params["clientInfo"].is<JsonObjectConst>() ||
+        !params["clientInfo"]["name"].is<const char*>() ||
+        !params["clientInfo"]["version"].is<const char*>()) {
+        return createJSONRPCError(200, static_cast<int>(ErrorCode::INVALID_PARAMS), request.id(),
+                                  "Invalid initialize parameters");
+    }
+
     MCPResponse response(200, request.id());
     JsonObject result = response.resultDoc.to<JsonObject>();
 
@@ -236,6 +272,11 @@ MCPResponse MCPServerBase::handlePing(MCPRequest& request) {
 }
 
 MCPResponse MCPServerBase::handleToolsList(MCPRequest& request) {
+    if (request.hasParams() && !request.params().is<JsonObjectConst>()) {
+        return createJSONRPCError(200, static_cast<int>(ErrorCode::INVALID_PARAMS), request.id(),
+                                  "tools/list params must be an object");
+    }
+
     MCPResponse response(200, request.id());
     JsonObject result = response.resultDoc.to<JsonObject>();
     JsonArray toolsArray = result["tools"].to<JsonArray>();
@@ -259,13 +300,17 @@ MCPResponse MCPServerBase::handleFunctionCalls(MCPRequest& request) {
     MCPResponse mcpResponse(200, request.id());
     JsonVariantConst params = request.params();
 
-    if (!params["name"].is<std::string>()) {
+    if (!params.is<JsonObjectConst>() || !params["name"].is<const char*>()) {
         return createJSONRPCError(200, static_cast<int>(ErrorCode::INVALID_PARAMS), request.id(),
                                   "Missing or invalid 'name' parameter");
     }
 
     const char* functionName = params["name"].as<const char*>();
     JsonVariantConst arguments = params["arguments"];
+    if (!arguments.isUnbound() && !arguments.is<JsonObjectConst>()) {
+        return createJSONRPCError(200, static_cast<int>(ErrorCode::INVALID_PARAMS), request.id(),
+                                  "'arguments' must be an object");
+    }
 
     JsonObject result = mcpResponse.resultDoc.to<JsonObject>();
     JsonArray content = result["content"].to<JsonArray>();
