@@ -74,11 +74,11 @@ const BleServerConfig& McpBle::getConfig() const {
 
 void McpBle::init(const std::string& deviceName) {
     if (_initialized) {
-        _stopped = false;
+        _stopped.store(false, std::memory_order_release);
         NimBLEDevice::startAdvertising();
         return;
     }
-    _stopped = false;
+    _stopped.store(false, std::memory_order_release);
 
     const std::string& name = deviceName.empty() ? _config.deviceName : deviceName;
     NimBLEDevice::init(name);
@@ -102,8 +102,6 @@ void McpBle::init(const std::string& deviceName) {
         TX_UUID,
         NIMBLE_PROPERTY::NOTIFY
     );
-
-    pService->start();
 
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
@@ -135,11 +133,12 @@ void McpBle::stop() {
      * internal locks; taking them in the other order here could deadlock). */
     {
         CbLock lock(_cbMutex);
-        _stopped = true;
+        _stopped.store(true, std::memory_order_release);
     }
     NimBLEDevice::stopAdvertising();
-    if (_connected && _pServer) {
-        _pServer->disconnect(_activeConnHandle);
+    const uint16_t activeHandle = _activeConnHandle.load(std::memory_order_acquire);
+    if (activeHandle != BLE_HS_CONN_HANDLE_NONE && _pServer) {
+        _pServer->disconnect(activeHandle);
     }
 }
 
@@ -159,25 +158,31 @@ void McpBle::setDisconnectCallback(DisconnectCallback cb) {
 }
 
 bool McpBle::sendNotification(const uint8_t* data, size_t len) {
-    if (!_connected || !_pTxCharacteristic) return false;
-    return _pTxCharacteristic->notify(data, len, _activeConnHandle);
+    const uint16_t activeHandle = _activeConnHandle.load(std::memory_order_acquire);
+    if (activeHandle == BLE_HS_CONN_HANDLE_NONE || !_pTxCharacteristic) return false;
+    return _pTxCharacteristic->notify(data, len, activeHandle);
 }
 
 uint16_t McpBle::getMtu() const {
-    return _mtu;
+    return _mtu.load(std::memory_order_acquire);
 }
 
 bool McpBle::isConnected() const {
-    return _connected;
+    return _activeConnHandle.load(std::memory_order_acquire) != BLE_HS_CONN_HANDLE_NONE;
 }
 
 uint16_t McpBle::activeConnHandle() const {
-    return _activeConnHandle;
+    return _activeConnHandle.load(std::memory_order_acquire);
 }
 
 bool McpBle::_onConnect(NimBLEServer* pServer) {
-    _connected = true;
-    _activeConnHandle = 0;
+    if (_stopped.load(std::memory_order_acquire)) {
+        return false;
+    }
+    uint16_t expected = BLE_HS_CONN_HANDLE_NONE;
+    if (!_activeConnHandle.compare_exchange_strong(expected, 0, std::memory_order_acq_rel) && expected != 0) {
+        return false;
+    }
     if (pServer) {
         pServer->stopAdvertising();
     } else {
@@ -188,16 +193,15 @@ bool McpBle::_onConnect(NimBLEServer* pServer) {
 
 void McpBle::_onDisconnect(NimBLEServer* pServer) {
     (void)pServer;
-    _connected = false;
-    _activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
-    _mtu = 23;  // Reset MTU
+    _activeConnHandle.store(BLE_HS_CONN_HANDLE_NONE, std::memory_order_release);
+    _mtu.store(23, std::memory_order_release);
     {
         CbLock lock(_cbMutex);
         /* Propagate the ATT-default MTU to listeners. Without this the
          * transport keeps the previous connection's negotiated MTU and frames
          * the next connection's pre-negotiation traffic too large to notify. */
         if (_mtuCallback) {
-            _mtuCallback(_mtu);
+            _mtuCallback(23);
         }
         if (_disconnectCallback) {
             _disconnectCallback();
@@ -205,7 +209,7 @@ void McpBle::_onDisconnect(NimBLEServer* pServer) {
         /* Checked under _cbMutex so it cannot race stop() setting the flag —
          * otherwise a peer disconnect landing during end() could restart
          * advertising after teardown completed. */
-        if (!_stopped) {
+        if (!_stopped.load(std::memory_order_acquire)) {
             NimBLEDevice::startAdvertising();
         }
     }
@@ -218,22 +222,21 @@ bool McpBle::_onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
          * can be delivered after teardown; admitting it would strand the
          * central on a server whose callbacks are gone. Drop it. */
         CbLock lock(_cbMutex);
-        if (_stopped) {
+        if (_stopped.load(std::memory_order_acquire)) {
             if (pServer) {
                 pServer->disconnect(connHandle);
             }
             return false;
         }
     }
-    if (_connected && _activeConnHandle != connHandle) {
+    uint16_t expected = BLE_HS_CONN_HANDLE_NONE;
+    if (!_activeConnHandle.compare_exchange_strong(expected, connHandle, std::memory_order_acq_rel) &&
+        expected != connHandle) {
         if (pServer) {
             pServer->disconnect(connHandle);
         }
         return false;
     }
-
-    _connected = true;
-    _activeConnHandle = connHandle;
     if (pServer) {
         pServer->stopAdvertising();
     } else {
@@ -244,22 +247,23 @@ bool McpBle::_onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
 
 void McpBle::_onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) {
     (void)reason;
-    if (!_connected || connInfo.getConnHandle() != _activeConnHandle) {
+    const uint16_t connHandle = connInfo.getConnHandle();
+    if (_activeConnHandle.load(std::memory_order_acquire) != connHandle) {
         return;
     }
     _onDisconnect(pServer);
 }
 
 void McpBle::_onMtuChange(uint16_t mtu) {
-    _mtu = mtu;
+    _mtu.store(mtu, std::memory_order_release);
     CbLock lock(_cbMutex);
     if (_mtuCallback) {
-        _mtuCallback(_mtu);
+        _mtuCallback(mtu);
     }
 }
 
 void McpBle::_onMtuChange(uint16_t mtu, NimBLEConnInfo& connInfo) {
-    if (!_connected || connInfo.getConnHandle() != _activeConnHandle) {
+    if (connInfo.getConnHandle() != _activeConnHandle.load(std::memory_order_acquire)) {
         return;
     }
     _onMtuChange(mtu);
@@ -276,7 +280,7 @@ void McpBle::_onWrite(NimBLECharacteristic* pCharacteristic) {
 }
 
 void McpBle::_onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) {
-    if (!_connected || connInfo.getConnHandle() != _activeConnHandle) {
+    if (connInfo.getConnHandle() != _activeConnHandle.load(std::memory_order_acquire)) {
         return;
     }
     _onWrite(pCharacteristic);

@@ -40,12 +40,16 @@ void mcp_http_test_fail_next_job_alloc(int n);
 
 class HttpMCPServer : public MCPServerBase {
    public:
-    // Construct only after WiFi is connected: setupMDNS() reads WiFi.localIP() to publish the
-    // `endpoint` TXT record, so a pre-connect construction would advertise 0.0.0.0.
+    // Call begin() only after WiFi is connected: setupMDNS() reads
+    // WiFi.localIP() to publish the endpoint TXT record.
     HttpMCPServer(uint16_t port, const String& name = DEFAULT_SERVER_NAME,
                   const String& version = DEFAULT_SERVER_VERSION,
                   const String& instructions = "");
     ~HttpMCPServer();
+
+    // Register all tools before calling begin(). Starting explicitly prevents
+    // request handlers from racing mutations of the tool registry.
+    bool begin();
 
    private:
     void setupWebServer();
@@ -65,6 +69,7 @@ class HttpMCPServer : public MCPServerBase {
 
     AsyncWebServer* server;
     uint16_t port;
+    bool started = false;
 
     /* tools/call handlers run on this worker task, fed through job_queue, so a
      * slow or blocking handler never stalls the async_tcp task (which services

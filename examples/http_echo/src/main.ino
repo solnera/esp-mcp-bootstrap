@@ -51,6 +51,7 @@ void setup() {
     echoTool.inputSchema.required.push_back("text");
     echoTool.handler = std::make_shared<EchoHandler>();
     mcpServer->RegisterTool(echoTool);
+    mcpServer->begin();
 
     Serial.println("\n========================================");
     Serial.println("MCP Server started successfully!");

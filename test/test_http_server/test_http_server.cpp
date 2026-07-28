@@ -61,6 +61,7 @@ struct TestServer {
         gate.handler = std::make_shared<GateHandler>();
         mcp.RegisterTool(gate);
 
+        TEST_ASSERT_TRUE(mcp.begin());
         web = mock_async_web::lastServer();
     }
 
@@ -401,6 +402,35 @@ void test_non_json_content_type_gets_415(void) {
     TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "application/json"));
 }
 
+void test_non_json_content_type_with_body_gets_415(void) {
+    TestServer srv;
+    AsyncWebServerRequest req;
+    req.setContentType("text/plain");
+    drivePost(srv, req, R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
+
+    TEST_ASSERT_EQUAL_INT(1, req.responseCount);
+    TEST_ASSERT_EQUAL_INT(415, req.lastCode);
+    TEST_ASSERT_NULL(req._tempObject);
+}
+
+void test_server_does_not_listen_until_begin(void) {
+    HttpMCPServer mcp(3001, "not-started", "1.0.0");
+    AsyncWebServer* web = mock_async_web::lastServer();
+    TEST_ASSERT_NOT_NULL(web);
+    TEST_ASSERT_FALSE(web->started);
+    TEST_ASSERT_NULL(web->findRoute("/mcp", HTTP_POST));
+
+    Tool tool;
+    tool.name = "early";
+    tool.inputSchema.type = "object";
+    tool.handler = std::make_shared<EchoHandler>();
+    mcp.RegisterTool(tool);
+
+    TEST_ASSERT_TRUE(mcp.begin());
+    TEST_ASSERT_TRUE(web->started);
+    TEST_ASSERT_NOT_NULL(web->findRoute("/mcp", HTTP_POST));
+}
+
 void test_aborted_upload_is_reclaimed_by_free(void) {
     /* The request dies mid-upload: onRequest never runs and the destructor
      * releases _tempObject with free(), as the real library does. The buffer
@@ -508,6 +538,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_body_overshooting_content_length_is_clamped_and_answered);
     RUN_TEST(test_undersized_body_gets_400_incomplete);
     RUN_TEST(test_non_json_content_type_gets_415);
+    RUN_TEST(test_non_json_content_type_with_body_gets_415);
+    RUN_TEST(test_server_does_not_listen_until_begin);
     RUN_TEST(test_aborted_upload_is_reclaimed_by_free);
     RUN_TEST(test_protocol_version_2025_06_18_header_is_accepted);
     RUN_TEST(test_unsupported_protocol_version_header_is_rejected);

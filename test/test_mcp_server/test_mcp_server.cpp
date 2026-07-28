@@ -103,7 +103,7 @@ void tearDown(void) {
 
 void test_parse_valid_request(void) {
     MCPRequest req = server->parseRequest(
-        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})");
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}})");
 
     TEST_ASSERT_EQUAL_STRING("initialize", req.method.c_str());
     TEST_ASSERT_EQUAL(1, req.id().as<int>());
@@ -146,11 +146,29 @@ void test_parse_with_arguments(void) {
     TEST_ASSERT_EQUAL_STRING("hello", req.params()["arguments"]["message"].as<const char*>());
 }
 
+void test_invalid_jsonrpc_envelope_is_rejected(void) {
+    const char* invalidRequests[] = {
+        R"({"id":1,"method":"ping"})",
+        R"({"jsonrpc":"1.0","id":1,"method":"ping"})",
+        R"({"jsonrpc":"2.0","id":{},"method":"ping"})",
+        R"({"jsonrpc":"2.0","id":1,"method":"ping","params":"bad"})",
+        R"([{"jsonrpc":"2.0","id":1,"method":"ping"}])",
+    };
+
+    for (const char* json : invalidRequests) {
+        MCPRequest req = server->parseRequest(json);
+        MCPResponse res = server->handle(req);
+        TEST_ASSERT_TRUE(req.invalidRequest);
+        TEST_ASSERT_TRUE(res.hasError());
+        TEST_ASSERT_EQUAL(-32600, res.error()["code"].as<int>());
+    }
+}
+
 /* ======== handle: initialize ======== */
 
 void test_handle_initialize(void) {
     MCPRequest req = server->parseRequest(
-        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})");
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}})");
     MCPResponse res = server->handle(req);
 
     TEST_ASSERT_EQUAL(200, res.code);
@@ -167,7 +185,7 @@ void test_handle_initialize(void) {
 
 void test_handle_initialize_negotiates_supported_legacy_version(void) {
     MCPRequest req = server->parseRequest(
-        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}})");
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}})");
     MCPResponse res = server->handle(req);
 
     TEST_ASSERT_EQUAL(200, res.code);
@@ -176,7 +194,7 @@ void test_handle_initialize_negotiates_supported_legacy_version(void) {
 
 void test_handle_initialize_falls_back_to_latest_for_unknown_version(void) {
     MCPRequest req = server->parseRequest(
-        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01"}})");
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}})");
     MCPResponse res = server->handle(req);
 
     TEST_ASSERT_EQUAL(200, res.code);
@@ -186,10 +204,20 @@ void test_handle_initialize_falls_back_to_latest_for_unknown_version(void) {
 void test_handle_initialize_no_instructions(void) {
     TestMCPServer srv("Srv", "2.0.0", "");
     MCPRequest req = srv.parseRequest(
-        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})");
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}})");
     MCPResponse res = srv.handle(req);
 
     TEST_ASSERT_TRUE(res.result()["instructions"].isNull());
+}
+
+void test_handle_initialize_requires_mandatory_params(void) {
+    MCPRequest req = server->parseRequest(
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}})");
+    MCPResponse res = server->handle(req);
+
+    TEST_ASSERT_TRUE(res.hasError());
+    TEST_ASSERT_EQUAL(-32602, res.error()["code"].as<int>());
+    TEST_ASSERT_EQUAL(1, res.id().as<int>());
 }
 
 /* ======== handle: notifications/initialized ======== */
@@ -522,6 +550,15 @@ void test_properties_basic_type(void) {
     p.toJson(obj);
 
     TEST_ASSERT_EQUAL_STRING("object", doc["type"].as<const char*>());
+}
+
+void test_properties_omits_empty_type(void) {
+    Properties props;
+    JsonDocument doc;
+    JsonObject obj = doc.to<JsonObject>();
+    props.toJson(obj);
+
+    TEST_ASSERT_TRUE(doc["type"].isUnbound());
 }
 
 void test_properties_with_title_desc(void) {
@@ -982,7 +1019,7 @@ void test_handle_tool_call_multiple_different_tools(void) {
 
 void test_roundtrip_initialize(void) {
     MCPRequest req = server->parseRequest(
-        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})");
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}})");
     MCPResponse res = server->handle(req);
     std::string json = server->serializeResponse(res);
 
@@ -1041,7 +1078,7 @@ void test_roundtrip_error(void) {
 void test_server_default_name_version(void) {
     TestMCPServer defaultServer;
     MCPRequest req = defaultServer.parseRequest(
-        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})");
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}})");
     MCPResponse res = defaultServer.handle(req);
 
     TEST_ASSERT_EQUAL_STRING("ESP32-MCP-Server", res.result()["serverInfo"]["name"].as<const char*>());
@@ -1195,7 +1232,7 @@ void test_handle_ping_notification_gets_no_response(void) {
 
 void test_handle_initialize_negotiates_2025_06_18(void) {
     MCPRequest req = server->parseRequest(
-        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})");
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-client","version":"1.0.0"}}})");
     MCPResponse res = server->handle(req);
 
     TEST_ASSERT_EQUAL(200, res.code);
@@ -1291,12 +1328,14 @@ int main(int argc, char** argv) {
     RUN_TEST(test_parse_empty_string);
     RUN_TEST(test_parse_no_params);
     RUN_TEST(test_parse_with_arguments);
+    RUN_TEST(test_invalid_jsonrpc_envelope_is_rejected);
 
     /* handle: initialize */
     RUN_TEST(test_handle_initialize);
     RUN_TEST(test_handle_initialize_negotiates_supported_legacy_version);
     RUN_TEST(test_handle_initialize_falls_back_to_latest_for_unknown_version);
     RUN_TEST(test_handle_initialize_no_instructions);
+    RUN_TEST(test_handle_initialize_requires_mandatory_params);
 
     /* handle: notifications */
     RUN_TEST(test_handle_notifications_initialized);
@@ -1342,6 +1381,7 @@ int main(int argc, char** argv) {
 
     /* Properties */
     RUN_TEST(test_properties_basic_type);
+    RUN_TEST(test_properties_omits_empty_type);
     RUN_TEST(test_properties_with_title_desc);
     RUN_TEST(test_properties_nested_with_required);
     RUN_TEST(test_properties_enum);

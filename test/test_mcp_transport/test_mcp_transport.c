@@ -21,6 +21,7 @@ static int  g_message_count;
 static uint8_t g_sent_packets[MAX_CAPTURED_PACKETS][MAX_PACKET_SIZE];
 static size_t  g_sent_packet_lens[MAX_CAPTURED_PACKETS];
 static int     g_sent_packet_count;
+static int     g_send_attempt_count;
 static int     g_send_fail_remaining;
 
 static void on_message(const char *message, void *ctx) {
@@ -33,6 +34,7 @@ static void on_message(const char *message, void *ctx) {
 
 static int on_send(const uint8_t *data, size_t len, void *ctx) {
     (void)ctx;
+    g_send_attempt_count++;
     if (g_send_fail_remaining > 0) {
         g_send_fail_remaining--;
         return -1;
@@ -52,6 +54,7 @@ static void reset_state(void) {
     memset(g_sent_packets, 0, sizeof(g_sent_packets));
     memset(g_sent_packet_lens, 0, sizeof(g_sent_packet_lens));
     g_sent_packet_count = 0;
+    g_send_attempt_count = 0;
     g_send_fail_remaining = 0;
 }
 
@@ -461,6 +464,15 @@ void test_send_all_retries_fail(void) {
     mcp_transport_set_send_retry(2, 0);
 
     mcp_transport_send_message("fail");
+    TEST_ASSERT_EQUAL_INT(0, g_sent_packet_count);
+}
+
+void test_send_retry_255_terminates_after_256_attempts(void) {
+    g_send_fail_remaining = 300;
+    mcp_transport_set_send_retry(255, 0);
+
+    mcp_transport_send_message("fail");
+    TEST_ASSERT_EQUAL_INT(256, g_send_attempt_count);
     TEST_ASSERT_EQUAL_INT(0, g_sent_packet_count);
 }
 
@@ -981,6 +993,7 @@ int main(void) {
     RUN_TEST(test_roundtrip_json_payload);
     RUN_TEST(test_send_retry_succeeds);
     RUN_TEST(test_send_all_retries_fail);
+    RUN_TEST(test_send_retry_255_terminates_after_256_attempts);
     RUN_TEST(test_send_without_send_fn);
     RUN_TEST(test_send_too_large);
 

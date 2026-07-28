@@ -23,8 +23,9 @@ struct MCPRequest {
     JsonDocument paramsDoc;
     bool hasIdField;
     bool parseError;
+    bool invalidRequest;
 
-    MCPRequest() : method(""), hasIdField(false), parseError(false) {}
+    MCPRequest() : method(""), hasIdField(false), parseError(false), invalidRequest(false) {}
 
     JsonVariantConst params() const {
         return paramsDoc.as<JsonVariantConst>();

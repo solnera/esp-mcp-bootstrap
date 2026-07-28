@@ -142,7 +142,9 @@ static bool mcp_transport_send_packet(const uint8_t *data, size_t len) {
         return false;
     }
 
-    for (uint8_t attempt = 0; attempt <= s_send_max_retries; attempt++) {
+    /* Use a wider counter than the public uint8_t retry setting. With uint8_t,
+     * max_retries == 255 wrapped attempt back to zero and never terminated. */
+    for (uint16_t attempt = 0; attempt <= (uint16_t)s_send_max_retries; attempt++) {
         int rc = s_send_fn(data, len, s_send_ctx);
         if (rc == 0) {
             return true;
