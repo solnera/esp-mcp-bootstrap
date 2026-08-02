@@ -17,7 +17,12 @@
  *     available when a message arrives.
  *   -DMCP_TRANSPORT_RX_BASELINE_CAP=<bytes>
  *     Size the RX buffer is grown from and shrunk back to between messages.
- *     Messages within this size incur no per-message allocation. Defaults to 256.
+ *     Messages within this size incur no per-message allocation. Defaults to 512,
+ *     chosen so an ordinary tools/call request fits without allocating.
+ *   -DMCP_TRANSPORT_RX_SHRINK_FACTOR=<n>
+ *     Growth is only released once the buffer exceeds n x baseline, so traffic
+ *     hovering around the baseline does not realloc twice per message. Defaults
+ *     to 4; set to 1 to restore shrink-on-every-message.
  */
 
 #ifdef __cplusplus

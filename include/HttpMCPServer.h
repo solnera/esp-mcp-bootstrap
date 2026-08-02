@@ -32,6 +32,15 @@
 #define MCP_HTTP_WORKER_STACK_SIZE 8192
 #endif
 
+// How long a tools/call may be waited on inline before falling back to the
+// deferred chunked reply. The deferred path can only be written when the
+// connection next polls (one lwIP coarse tick, ~500 ms), so without a short
+// wait even a 2 ms tool answers in half a second. The cost is blocking
+// async_tcp for at most this long. Set to 0 to always defer.
+#ifndef MCP_HTTP_FAST_PATH_WAIT_MS
+#define MCP_HTTP_FAST_PATH_WAIT_MS 20
+#endif
+
 #ifdef MCP_HTTP_TEST_HOOKS
 /* Test-only: force the next `n` deferred-job allocations to fail (simulate
  * OOM). Compiled out of production builds. */

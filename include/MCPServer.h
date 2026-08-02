@@ -4,8 +4,10 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 
+#include <functional>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 // MCP protocol versions supported by this library. The default is the latest
@@ -19,16 +21,26 @@ extern const char* const DEFAULT_SERVER_VERSION;
 
 struct MCPRequest {
     std::string method;
+
+    /* The parse result is retained whole and params() is a view into it, so a
+     * tools/call payload is never deep-copied out into a second document. The
+     * id keeps its own (scalar-sized) copy: parseRequest deliberately leaves it
+     * null for a malformed id so the reply carries id:null, which a view into
+     * doc could not express. */
+    JsonDocument doc;
     JsonDocument idDoc;
-    JsonDocument paramsDoc;
     bool hasIdField;
     bool parseError;
     bool invalidRequest;
+    // Set only once params has passed validation, so the early-return paths
+    // expose no params at all — as they did when params had its own document.
+    bool paramsChecked;
 
-    MCPRequest() : method(""), hasIdField(false), parseError(false), invalidRequest(false) {}
+    MCPRequest()
+        : method(""), hasIdField(false), parseError(false), invalidRequest(false), paramsChecked(false) {}
 
     JsonVariantConst params() const {
-        return paramsDoc.as<JsonVariantConst>();
+        return paramsChecked ? doc["params"] : JsonVariantConst();
     }
 
     JsonVariantConst id() const {
@@ -36,7 +48,7 @@ struct MCPRequest {
     }
 
     bool hasParams() const {
-        return !paramsDoc.isNull();
+        return paramsChecked && !doc["params"].isNull();
     }
 
     bool isNotification() const {
@@ -48,6 +60,13 @@ struct MCPResponse {
     JsonDocument idDoc;
     JsonDocument resultDoc;
     JsonDocument errorDoc;
+
+    /* Already-serialized result JSON, spliced straight into the reply. Lets a
+     * handler hand back a cached body (tools/list) without rebuilding the tree
+     * and without a document-to-document deep copy. Takes precedence over
+     * resultDoc when non-empty. */
+    std::string rawResult;
+
     int code;
     bool body;
 
@@ -71,7 +90,7 @@ struct MCPResponse {
     }
 
     bool hasResult() const {
-        return !resultDoc.isNull();
+        return !rawResult.empty() || !resultDoc.isNull();
     }
     bool hasError() const {
         return !errorDoc.isNull();
@@ -211,8 +230,15 @@ class MCPServerBase {
     virtual ~MCPServerBase() = default;
 
     void RegisterTool(const Tool& tool);
+    // Overload for callers that can give up ownership: skips the deep copy of
+    // the (recursive) schema tree. Equivalent in every other respect.
+    void RegisterTool(Tool&& tool);
 
    protected:
+    /* The const char* form is the real one; both transports hand us a
+     * NUL-terminated buffer, and routing that through std::string built a
+     * throwaway copy of the whole request body on every call. */
+    MCPRequest parseRequest(const char* json);
     MCPRequest parseRequest(const std::string& json);
     std::string serializeResponse(const MCPResponse& response);
     MCPResponse createJSONRPCError(int httpCode, int rpcCode, const JsonVariantConst& id, const std::string& message);
@@ -224,7 +250,28 @@ class MCPServerBase {
     bool isSupportedProtocolVersion(const char* version) const;
     const char* negotiateProtocolVersion(JsonVariantConst params) const;
 
-    std::map<String, Tool> tools;
+    /* Serialized tools/list body, rebuilt only after the tool set changes.
+     * Capabilities advertise listChanged:false, so between registrations this
+     * is a constant — and clients ask for it on every session start.
+     *
+     * INVARIANT: unsynchronized. Unlike the rest of handle(), this touches
+     * mutable server state, so it may only be reached from the one task that
+     * drives a given server instance — async_tcp for HTTP (the worker queue
+     * takes tools/call and nothing else), the RX worker for BLE. Routing
+     * tools/list onto a second task would need a lock here. */
+    const std::string& toolsListJson();
+
+    /* Keyed on std::string rather than Arduino String so a lookup key built
+     * from the request costs no heap: short-string optimization keeps tool
+     * names of ~15 characters entirely on the stack, whereas String always
+     * allocates. Deliberately NOT std::less<> — a transparent comparator would
+     * drop the temporary entirely, but it is C++14 and this is a public header
+     * compiled as part of the consumer's sketch, which the ESP32 Arduino
+     * framework still builds as gnu++11. */
+    std::map<std::string, Tool> tools;
+    std::string toolsListCache;
+    bool toolsListDirty = true;
+
     String serverName;
     String serverVersion;
     String serverInstructions;

@@ -444,6 +444,38 @@ void HttpMCPServer::deferToolCall(AsyncWebServerRequest* request, MCPRequest&& m
         return;
     }
 
+    JobRef ref(job);  // adopts the creator reference
+
+    /* Fast path. The deferred reply below can only be written when the filler
+     * next runs, and that is driven by tcp_poll at one lwIP coarse tick —
+     * ~500 ms. Most tools (read a pin, read a sensor) finish in single-digit
+     * milliseconds, so without this a 2 ms tool still answered in half a
+     * second. Giving the worker a brief bounded window and replying inline when
+     * it lands removes that floor for the common case.
+     *
+     * This does block async_tcp, which is exactly what the worker exists to
+     * avoid — but bounded by a handful of milliseconds, not by an arbitrary
+     * handler. Set MCP_HTTP_FAST_PATH_WAIT_MS to 0 to opt out entirely and
+     * always defer. */
+#if MCP_HTTP_FAST_PATH_WAIT_MS > 0
+    for (uint32_t waited = 0; waited < MCP_HTTP_FAST_PATH_WAIT_MS; waited++) {
+        if (ref->done.load(std::memory_order_acquire)) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (ref->done.load(std::memory_order_acquire)) {
+        /* Plain, length-delimited response: no chunk framing, and one fewer
+         * round of filler callbacks. hasBody() is implied — tools/call always
+         * produces one, and notifications never reach deferToolCall. */
+        AsyncWebServerResponse* inlineResponse =
+            request->beginResponse(200, "application/json", ref->response.c_str());
+        inlineResponse->addHeader("MCP-Protocol-Version", PROTOCOL_VERSION);
+        request->send(inlineResponse);
+        return;
+    }
+#endif
+
     /* The filler runs on the async_tcp task whenever the TCP window opens or
      * the connection polls (~500 ms). It captures only the job — never `this` —
      * so a response outliving the server cannot touch freed state. Returning
@@ -451,7 +483,6 @@ void HttpMCPServer::deferToolCall(AsyncWebServerRequest* request, MCPRequest&& m
      * without blocking; ESPAsyncWebServer already disables the 3 s RX idle
      * timeout for the connection once send() is called. Returning 0 emits the
      * terminating chunk. */
-    JobRef ref(job);  // adopts the creator reference
     AsyncWebServerResponse* httpResponse = request->beginChunkedResponse(
         "application/json", [ref](uint8_t* buffer, size_t maxLen, size_t index) -> size_t {
             if (!ref->done.load(std::memory_order_acquire)) {

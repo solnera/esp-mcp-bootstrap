@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 
 #include <cstring>
+#include <utility>
 
 const char* const PROTOCOL_VERSION = "2025-11-25";
 const char* const PROTOCOL_VERSION_2025_06_18 = "2025-06-18";
@@ -127,27 +128,44 @@ MCPServerBase::MCPServerBase(const String& name, const String& version, const St
 }
 
 void MCPServerBase::RegisterTool(const Tool& tool) {
-    tools[tool.name] = tool;
+    tools[std::string(tool.name.c_str())] = tool;
+    toolsListDirty = true;
+}
+
+void MCPServerBase::RegisterTool(Tool&& tool) {
+    tools[std::string(tool.name.c_str())] = std::move(tool);
+    toolsListDirty = true;
 }
 
 MCPRequest MCPServerBase::parseRequest(const std::string& json) {
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, json);
+    return parseRequest(json.c_str());
+}
 
+MCPRequest MCPServerBase::parseRequest(const char* json) {
     MCPRequest request;
 
+    if (!json) {
+        request.parseError = true;
+        return request;
+    }
+
+    // Deserialize straight into the request's own document: the parse result is
+    // what we keep, so there is nothing left to copy out of a scratch document.
+    DeserializationError error = deserializeJson(request.doc, json);
+
     if (error) {
+        request.doc.clear();  // a failed parse may leave a partial tree behind
         request.method = "";
         request.parseError = true;
         return request;
     }
 
-    if (!doc.is<JsonObjectConst>()) {
+    if (!request.doc.is<JsonObjectConst>()) {
         request.invalidRequest = true;
         return request;
     }
 
-    JsonObjectConst root = doc.as<JsonObjectConst>();
+    JsonObjectConst root = request.doc.as<JsonObjectConst>();
     JsonVariantConst versionVar = root["jsonrpc"];
     JsonVariantConst methodVar = root["method"];
     JsonVariantConst idVar = root["id"];
@@ -174,29 +192,61 @@ MCPRequest MCPServerBase::parseRequest(const std::string& json) {
     }
 
     request.method = methodVar.as<const char*>();
-    request.paramsDoc.set(paramsVar);
+    request.paramsChecked = true;
     return request;
 }
+
+namespace {
+
+/* Appending sink for serializeJson. ArduinoJson's std::string writer clears the
+ * destination in its constructor, so emitting several documents into one buffer
+ * needs a writer that only ever appends; the default Writer template picks this
+ * up by duck-typing on write(). */
+struct StringAppender {
+    std::string* out;
+
+    size_t write(uint8_t c) {
+        out->push_back(static_cast<char>(c));
+        return 1;
+    }
+
+    size_t write(const uint8_t* s, size_t n) {
+        out->append(reinterpret_cast<const char*>(s), n);
+        return n;
+    }
+};
+
+}  // namespace
 
 std::string MCPServerBase::serializeResponse(const MCPResponse& response) {
     if (!response.hasBody()) {
         return "";
     }
 
-    JsonDocument doc;
-    doc["id"] = response.id();
-    doc["jsonrpc"] = "2.0";
+    /* Written out directly rather than assembled in a scratch JsonDocument:
+     * copying result/error into a wrapper document deep-copied the entire
+     * payload one more time, which on an 8 KiB tool result is the difference
+     * between one and two full-size trees resident at once. */
+    std::string out;
+    StringAppender sink{&out};
 
-    if (response.hasResult()) {
-        doc["result"] = response.result();
+    out += "{\"jsonrpc\":\"2.0\",\"id\":";
+    serializeJson(response.idDoc, sink);  // a null document emits `null`, per spec
+
+    if (!response.rawResult.empty()) {
+        out += ",\"result\":";
+        out += response.rawResult;
+    } else if (!response.resultDoc.isNull()) {
+        out += ",\"result\":";
+        serializeJson(response.resultDoc, sink);
     }
     if (response.hasError()) {
-        doc["error"] = response.error();
+        out += ",\"error\":";
+        serializeJson(response.errorDoc, sink);
     }
+    out += "}";
 
-    std::string jsonResponse;
-    serializeJson(doc, jsonResponse);
-    return jsonResponse;
+    return out;
 }
 
 MCPResponse MCPServerBase::handle(MCPRequest& request) {
@@ -271,14 +321,13 @@ MCPResponse MCPServerBase::handlePing(MCPRequest& request) {
     return response;
 }
 
-MCPResponse MCPServerBase::handleToolsList(MCPRequest& request) {
-    if (request.hasParams() && !request.params().is<JsonObjectConst>()) {
-        return createJSONRPCError(200, static_cast<int>(ErrorCode::INVALID_PARAMS), request.id(),
-                                  "tools/list params must be an object");
+const std::string& MCPServerBase::toolsListJson() {
+    if (!toolsListDirty) {
+        return toolsListCache;
     }
 
-    MCPResponse response(200, request.id());
-    JsonObject result = response.resultDoc.to<JsonObject>();
+    JsonDocument doc;
+    JsonObject result = doc.to<JsonObject>();
     JsonArray toolsArray = result["tools"].to<JsonArray>();
     for (const auto& [key, value] : tools) {
         JsonObject tool = toolsArray.add<JsonObject>();
@@ -293,6 +342,21 @@ MCPResponse MCPServerBase::handleToolsList(MCPRequest& request) {
             value.outputSchema.toJson(outputSchemaObj);
         }
     }
+
+    serializeJson(doc, toolsListCache);  // the std::string writer clears for us
+    toolsListDirty = false;
+    return toolsListCache;
+}
+
+MCPResponse MCPServerBase::handleToolsList(MCPRequest& request) {
+    if (request.hasParams() && !request.params().is<JsonObjectConst>()) {
+        return createJSONRPCError(200, static_cast<int>(ErrorCode::INVALID_PARAMS), request.id(),
+                                  "tools/list params must be an object");
+    }
+
+    MCPResponse response(200, request.id());
+    // Walking the schema tree once per registration rather than once per request.
+    response.rawResult = toolsListJson();
     return response;
 }
 
@@ -315,23 +379,36 @@ MCPResponse MCPServerBase::handleFunctionCalls(MCPRequest& request) {
     JsonObject result = mcpResponse.resultDoc.to<JsonObject>();
     JsonArray content = result["content"].to<JsonArray>();
 
-    auto toolIt = tools.find(String(functionName));
+    // Short-string optimization keeps this key off the heap for normal names.
+    auto toolIt = tools.find(std::string(functionName));
     if (toolIt != tools.end()) {
         if (toolIt->second.handler) {
             bool toolError = false;
             JsonDocument resultDoc = toolIt->second.handler->call(arguments, toolError);
 
-            String resultText;
-            serializeJson(resultDoc, resultText);
+            /* structuredContent is defined by MCP as a JSON object, and an
+             * error payload would not conform to a declared outputSchema —
+             * attach it only for successful object results. Non-object
+             * results still reach the client as serialized text content. */
+            const bool structured = !toolError && resultDoc.is<JsonObjectConst>();
 
-            JsonObject textContent = content.add<JsonObject>();
-            textContent["type"] = "text";
-            textContent["text"] = resultText;
-            if (!toolError && resultDoc.is<JsonObjectConst>()) {
-                /* structuredContent is defined by MCP as a JSON object, and an
-                 * error payload would not conform to a declared outputSchema —
-                 * attach it only for successful object results. Non-object
-                 * results still reach the client as serialized text content. */
+#if defined(MCP_OMIT_TEXT_WHEN_STRUCTURED) && MCP_OMIT_TEXT_WHEN_STRUCTURED
+            /* MCP only says a structured result SHOULD be mirrored as text, and
+             * carrying both puts the payload on the wire (and in RAM) twice.
+             * Opt-in because clients predating structuredContent read the text. */
+            const bool emitText = !structured;
+#else
+            const bool emitText = true;
+#endif
+            if (emitText) {
+                String resultText;
+                serializeJson(resultDoc, resultText);
+
+                JsonObject textContent = content.add<JsonObject>();
+                textContent["type"] = "text";
+                textContent["text"] = resultText;
+            }
+            if (structured) {
                 result["structuredContent"].set(resultDoc.as<JsonVariantConst>());
             }
             result["isError"] = toolError;

@@ -673,11 +673,46 @@ void test_device_name_is_advertised(void) {
     TEST_ASSERT_EQUAL_STRING("MCP_Server_BLE", advName.c_str());
 }
 
+void test_preferred_mtu_is_offered_during_init(void) {
+    /* Fragment count is driven by the negotiated MTU, and NimBLE only offers
+     * more than the 23-byte default if asked. McpBle is a process-wide
+     * singleton whose init() runs once, so this asserts the value that first
+     * begin() published rather than resetting and re-initialising. */
+    BLEMCPServer server("test-ble", "1.0.0");
+    server.begin();
+    server.end();
+
+    TEST_ASSERT_EQUAL_INT(517, mock_ble::lastPreferredMtu().load());
+}
+
+void test_default_tx_gap_is_zero(void) {
+    /* The per-fragment delay used to be a hardcoded 1 tick, which on a 1 kHz
+     * tick cost ~430 ms for an 8 KiB message at the default MTU. Backpressure
+     * is handled by the send-retry path instead. */
+    TEST_ASSERT_EQUAL_UINT32(0, McpBle::getInstance().getConfig().txGapTicks);
+}
+
+void test_tx_gap_is_configurable(void) {
+    auto& ble = McpBle::getInstance();
+    BleServerConfig restore = ble.getConfig();
+
+    BleServerConfig cfg = restore;
+    cfg.txGapTicks = 3;
+    ble.setConfig(cfg);
+    TEST_ASSERT_EQUAL_UINT32(3, ble.getConfig().txGapTicks);
+
+    ble.setConfig(restore);
+    TEST_ASSERT_EQUAL_UINT32(0, ble.getConfig().txGapTicks);
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
     UNITY_BEGIN();
+    RUN_TEST(test_preferred_mtu_is_offered_during_init);
+    RUN_TEST(test_default_tx_gap_is_zero);
+    RUN_TEST(test_tx_gap_is_configurable);
     RUN_TEST(test_end_waits_until_worker_task_exits);
     RUN_TEST(test_end_waits_past_five_second_timeout_until_handler_finishes);
     RUN_TEST(test_concurrent_sends_are_serialized);

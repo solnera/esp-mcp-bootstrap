@@ -31,6 +31,20 @@ struct BleServerConfig {
     uint16_t connMaxInterval = 24;          // 30 ms
     uint16_t connSlaveLatency = 4;
     uint16_t connSupervisionTimeout = 400;  // 4 s
+
+    /* Preferred ATT MTU offered during negotiation. Fragment count is set by
+     * the negotiated MTU: at the 23-byte default each packet carries 19 payload
+     * bytes, at 517 it carries 511 — a ~27x difference in packets for the same
+     * message. A central that cannot go this high simply negotiates down, so
+     * this is safe to leave at the maximum. */
+    uint16_t preferredMtu = 517;
+
+    /* Delay inserted between outbound fragments, in ticks. Was unconditionally
+     * 1 tick, which on a 1 kHz tick meant an 8 KiB message at the default MTU
+     * spent ~430 ms asleep. Backpressure is already handled by the send-retry
+     * path, so the default is now 0; raise it if a particular central drops
+     * notifications under back-to-back writes. */
+    uint32_t txGapTicks = 0;
 };
 
 class McpBle {

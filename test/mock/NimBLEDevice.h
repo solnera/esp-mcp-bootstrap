@@ -20,6 +20,8 @@ inline std::atomic<int>& disconnectCount() { static std::atomic<int> c{0}; retur
 inline std::atomic<int>& lastDisconnectConnHandle() { static std::atomic<int> h{-1}; return h; }
 inline std::atomic<int>& stopAdvertisingCount() { static std::atomic<int> c{0}; return c; }
 inline std::atomic<int>& startAdvertisingCount() { static std::atomic<int> c{0}; return c; }
+// Last preferred MTU offered via NimBLEDevice::setMTU(); -1 if never called.
+inline std::atomic<int>& lastPreferredMtu() { static std::atomic<int> m{-1}; return m; }
 inline std::vector<uint8_t>& lastNotifyPayload() { static std::vector<uint8_t> p; return p; }
 inline void failNextNotify(int n) { notifyFailCountdown().store(n); }
 inline void resetNotifyTracking() {
@@ -245,6 +247,11 @@ public:
     }
     static bool stopAdvertising() {
         mock_ble::stopAdvertisingCount().fetch_add(1);
+        return true;
+    }
+    // Matches NimBLE-Arduino 2.x: bool, true on success.
+    static bool setMTU(uint16_t mtu) {
+        mock_ble::lastPreferredMtu().store(mtu);
         return true;
     }
 };

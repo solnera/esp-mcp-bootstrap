@@ -13,7 +13,32 @@ public:
     using MCPServerBase::handle;
     using MCPServerBase::createJSONRPCError;
     using MCPServerBase::tools;
+    using MCPServerBase::toolsListJson;
 };
+
+/* tools/list answers from a pre-serialized cache rather than a JsonDocument, so
+ * its body has to be read back off the wire. Asserting on the serialized reply
+ * is what the client actually sees anyway. */
+static void parseResponseBody(TestMCPServer* server, const MCPResponse& res, JsonDocument& out) {
+    std::string json = server->serializeResponse(res);
+    DeserializationError err = deserializeJson(out, json);
+    TEST_ASSERT_FALSE(err);
+}
+
+/* Reads a tool's payload out of a result whichever way it was carried, so tests
+ * about the payload itself stay valid under MCP_OMIT_TEXT_WHEN_STRUCTURED.
+ * Tests specifically about the text/structured split assert on the raw result
+ * instead — see test_structured_result_text_mirroring_follows_build_flag. */
+static void readToolPayload(JsonVariantConst result, JsonDocument& out) {
+    JsonVariantConst structured = result["structuredContent"];
+    if (!structured.isNull()) {
+        out.set(structured);
+        return;
+    }
+    const char* text = result["content"][0]["text"].as<const char*>();
+    TEST_ASSERT_NOT_NULL(text);
+    TEST_ASSERT_FALSE(deserializeJson(out, text));
+}
 
 class EchoHandler : public ToolHandler {
 public:
@@ -242,7 +267,11 @@ void test_handle_tools_list_empty(void) {
 
     TEST_ASSERT_EQUAL(200, res.code);
     TEST_ASSERT_TRUE(res.hasResult());
-    TEST_ASSERT_EQUAL(0, res.result()["tools"].as<JsonArrayConst>().size());
+
+    JsonDocument body;
+    parseResponseBody(server, res, body);
+    TEST_ASSERT_TRUE(body["result"]["tools"].is<JsonArrayConst>());
+    TEST_ASSERT_EQUAL(0, body["result"]["tools"].as<JsonArrayConst>().size());
 }
 
 void test_handle_tools_list_with_tool(void) {
@@ -263,7 +292,9 @@ void test_handle_tools_list_with_tool(void) {
         R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
     MCPResponse res = server->handle(req);
 
-    JsonArrayConst tools = res.result()["tools"].as<JsonArrayConst>();
+    JsonDocument body;
+    parseResponseBody(server, res, body);
+    JsonArrayConst tools = body["result"]["tools"].as<JsonArrayConst>();
     TEST_ASSERT_EQUAL(1, tools.size());
     TEST_ASSERT_EQUAL_STRING("echo", tools[0]["name"].as<const char*>());
     TEST_ASSERT_EQUAL_STRING("Echo tool", tools[0]["description"].as<const char*>());
@@ -292,7 +323,9 @@ void test_handle_tools_list_multiple_tools(void) {
         R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
     MCPResponse res = server->handle(req);
 
-    TEST_ASSERT_EQUAL(2, res.result()["tools"].as<JsonArrayConst>().size());
+    JsonDocument body;
+    parseResponseBody(server, res, body);
+    TEST_ASSERT_EQUAL(2, body["result"]["tools"].as<JsonArrayConst>().size());
 }
 
 void test_handle_tools_list_with_output_schema(void) {
@@ -312,10 +345,85 @@ void test_handle_tools_list_with_output_schema(void) {
         R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
     MCPResponse res = server->handle(req);
 
-    JsonVariantConst t = res.result()["tools"][0];
+    JsonDocument body;
+    parseResponseBody(server, res, body);
+    JsonVariantConst t = body["result"]["tools"][0];
     TEST_ASSERT_EQUAL_STRING("object", t["outputSchema"]["type"].as<const char*>());
     TEST_ASSERT_EQUAL_STRING("string",
         t["outputSchema"]["properties"]["result"]["type"].as<const char*>());
+}
+
+/* ======== tools/list caching ======== */
+
+void test_tools_list_body_is_cached_between_calls(void) {
+    Tool tool;
+    tool.name = "cached";
+    tool.description = "original";
+    tool.inputSchema.type = "object";
+    tool.handler = std::make_shared<EchoHandler>();
+    server->RegisterTool(tool);
+
+    TEST_ASSERT_NOT_NULL(strstr(server->toolsListJson().c_str(), "original"));
+
+    /* Mutate the stored tool behind RegisterTool's back, so nothing marks the
+     * cache dirty. A rebuild-per-request implementation would pick the new
+     * description up; the cache must not. */
+    server->tools.find("cached")->second.description = "mutated";
+    TEST_ASSERT_NOT_NULL(strstr(server->toolsListJson().c_str(), "original"));
+    TEST_ASSERT_NULL(strstr(server->toolsListJson().c_str(), "mutated"));
+}
+
+void test_registering_a_tool_invalidates_the_tools_list_cache(void) {
+    MCPRequest first = server->parseRequest(
+        R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
+    MCPResponse firstRes = server->handle(first);
+    JsonDocument firstBody;
+    parseResponseBody(server, firstRes, firstBody);
+    TEST_ASSERT_EQUAL(0, firstBody["result"]["tools"].as<JsonArrayConst>().size());
+
+    Tool tool;
+    tool.name = "late";
+    tool.description = "registered after the first list";
+    tool.inputSchema.type = "object";
+    tool.handler = std::make_shared<EchoHandler>();
+    server->RegisterTool(tool);
+
+    MCPRequest second = server->parseRequest(
+        R"({"jsonrpc":"2.0","id":2,"method":"tools/list"})");
+    MCPResponse secondRes = server->handle(second);
+    JsonDocument secondBody;
+    parseResponseBody(server, secondRes, secondBody);
+    TEST_ASSERT_EQUAL(1, secondBody["result"]["tools"].as<JsonArrayConst>().size());
+    TEST_ASSERT_EQUAL_STRING("late", secondBody["result"]["tools"][0]["name"].as<const char*>());
+}
+
+void test_register_tool_move_overload_registers_and_invalidates(void) {
+    Tool tool;
+    tool.name = "moved";
+    tool.description = "Moved in";
+    tool.inputSchema.type = "object";
+
+    Properties prop;
+    prop.type = "string";
+    tool.inputSchema.properties["field"] = prop;
+    tool.handler = std::make_shared<EchoHandler>();
+
+    server->RegisterTool(std::move(tool));
+
+    TEST_ASSERT_EQUAL(1, server->tools.size());
+
+    MCPRequest req = server->parseRequest(
+        R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
+    MCPResponse res = server->handle(req);
+    JsonDocument body;
+    parseResponseBody(server, res, body);
+
+    JsonVariantConst listed = body["result"]["tools"][0];
+    TEST_ASSERT_EQUAL_STRING("moved", listed["name"].as<const char*>());
+    TEST_ASSERT_EQUAL_STRING("Moved in", listed["description"].as<const char*>());
+    /* The schema tree has to survive the move, not just the scalar fields. */
+    TEST_ASSERT_EQUAL_STRING("string",
+        listed["inputSchema"]["properties"]["field"]["type"].as<const char*>());
 }
 
 /* ======== handle: tools/call ======== */
@@ -336,16 +444,40 @@ void test_handle_tool_call_success(void) {
     TEST_ASSERT_TRUE(res.hasResult());
     TEST_ASSERT_FALSE(res.hasError());
 
-    JsonArrayConst content = res.result()["content"].as<JsonArrayConst>();
-    TEST_ASSERT_EQUAL(1, content.size());
-    TEST_ASSERT_EQUAL_STRING("text", content[0]["type"].as<const char*>());
+    JsonDocument payload;
+    readToolPayload(res.result(), payload);
+    TEST_ASSERT_EQUAL_STRING("hello", payload["echo"].as<const char*>());
+    TEST_ASSERT_EQUAL_STRING("hello", res.result()["structuredContent"]["echo"].as<const char*>());
+    TEST_ASSERT_FALSE(res.result()["isError"].as<bool>());
+}
 
-    /* Parse the text field (serialized JSON from handler) */
+void test_structured_result_text_mirroring_follows_build_flag(void) {
+    /* structuredContent is always attached for a successful object result.
+     * Whether it is ALSO mirrored as serialized text depends on
+     * MCP_OMIT_TEXT_WHEN_STRUCTURED; env:native and env:native-omit-text
+     * explicitly build the numeric 0 and 1 sides. */
+    Tool tool;
+    tool.name = "echo";
+    tool.description = "Echo";
+    tool.inputSchema.type = "object";
+    tool.handler = std::make_shared<EchoHandler>();
+    server->RegisterTool(tool);
+
+    MCPRequest req = server->parseRequest(
+        R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"message":"hello"}}})");
+    MCPResponse res = server->handle(req);
+
+    TEST_ASSERT_EQUAL_STRING("hello", res.result()["structuredContent"]["echo"].as<const char*>());
+
+    JsonArrayConst content = res.result()["content"].as<JsonArrayConst>();
+#if defined(MCP_OMIT_TEXT_WHEN_STRUCTURED) && MCP_OMIT_TEXT_WHEN_STRUCTURED
+    TEST_ASSERT_EQUAL(0, content.size());
+#else
+    TEST_ASSERT_EQUAL(1, content.size());
     JsonDocument textDoc;
     deserializeJson(textDoc, content[0]["text"].as<const char*>());
     TEST_ASSERT_EQUAL_STRING("hello", textDoc["echo"].as<const char*>());
-    TEST_ASSERT_EQUAL_STRING("hello", res.result()["structuredContent"]["echo"].as<const char*>());
-    TEST_ASSERT_FALSE(res.result()["isError"].as<bool>());
+#endif
 }
 
 void test_handle_tool_call_handler_reports_execution_error(void) {
@@ -535,8 +667,11 @@ void test_register_overwrites_same_name(void) {
     MCPRequest req = server->parseRequest(
         R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
     MCPResponse res = server->handle(req);
+
+    JsonDocument body;
+    parseResponseBody(server, res, body);
     TEST_ASSERT_EQUAL_STRING("second",
-        res.result()["tools"][0]["description"].as<const char*>());
+        body["result"]["tools"][0]["description"].as<const char*>());
 }
 
 /* ======== Properties serialization ======== */
@@ -950,15 +1085,12 @@ void test_handle_tool_call_complex_result(void) {
     MCPResponse res = server->handle(req);
 
     TEST_ASSERT_EQUAL(200, res.code);
-    JsonArrayConst content = res.result()["content"].as<JsonArrayConst>();
-    TEST_ASSERT_EQUAL(1, content.size());
-    TEST_ASSERT_EQUAL_STRING("text", content[0]["type"].as<const char*>());
 
-    JsonDocument textDoc;
-    deserializeJson(textDoc, content[0]["text"].as<const char*>());
-    TEST_ASSERT_EQUAL_STRING("ok", textDoc["status"].as<const char*>());
-    TEST_ASSERT_EQUAL(3, textDoc["items"].as<JsonArrayConst>().size());
-    TEST_ASSERT_EQUAL_STRING("value", textDoc["nested"]["key"].as<const char*>());
+    JsonDocument payload;
+    readToolPayload(res.result(), payload);
+    TEST_ASSERT_EQUAL_STRING("ok", payload["status"].as<const char*>());
+    TEST_ASSERT_EQUAL(3, payload["items"].as<JsonArrayConst>().size());
+    TEST_ASSERT_EQUAL_STRING("value", payload["nested"]["key"].as<const char*>());
 }
 
 void test_handle_tool_call_empty_result(void) {
@@ -1002,7 +1134,7 @@ void test_handle_tool_call_multiple_different_tools(void) {
     MCPResponse res1 = server->handle(req1);
     TEST_ASSERT_TRUE(res1.hasResult());
     JsonDocument doc1;
-    deserializeJson(doc1, res1.result()["content"][0]["text"].as<const char*>());
+    readToolPayload(res1.result(), doc1);
     TEST_ASSERT_EQUAL_STRING("hi", doc1["echo"].as<const char*>());
 
     /* Call complex */
@@ -1011,7 +1143,7 @@ void test_handle_tool_call_multiple_different_tools(void) {
     MCPResponse res2 = server->handle(req2);
     TEST_ASSERT_TRUE(res2.hasResult());
     JsonDocument doc2;
-    deserializeJson(doc2, res2.result()["content"][0]["text"].as<const char*>());
+    readToolPayload(res2.result(), doc2);
     TEST_ASSERT_EQUAL_STRING("ok", doc2["status"].as<const char*>());
 }
 
@@ -1051,11 +1183,10 @@ void test_roundtrip_tool_call(void) {
     TEST_ASSERT_EQUAL_STRING("abc", doc["id"].as<const char*>());
     TEST_ASSERT_TRUE(doc["error"].isNull());
 
-    /* Verify nested result text */
-    const char* text = doc["result"]["content"][0]["text"].as<const char*>();
-    JsonDocument textDoc;
-    deserializeJson(textDoc, text);
-    TEST_ASSERT_EQUAL_STRING("world", textDoc["echo"].as<const char*>());
+    /* Verify the payload survived the full parse → handle → serialize trip */
+    JsonDocument payload;
+    readToolPayload(doc["result"], payload);
+    TEST_ASSERT_EQUAL_STRING("world", payload["echo"].as<const char*>());
     TEST_ASSERT_EQUAL_STRING("world", doc["result"]["structuredContent"]["echo"].as<const char*>());
 }
 
@@ -1169,7 +1300,9 @@ void test_handle_tools_list_complex_schemas(void) {
         R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})");
     MCPResponse res = server->handle(req);
 
-    JsonVariantConst t = res.result()["tools"][0];
+    JsonDocument body;
+    parseResponseBody(server, res, body);
+    JsonVariantConst t = body["result"]["tools"][0];
     JsonVariantConst schema = t["inputSchema"];
     TEST_ASSERT_FALSE(schema["additionalProperties"].as<bool>());
     TEST_ASSERT_EQUAL_STRING("email", schema["properties"]["name"]["format"].as<const char*>());
@@ -1360,6 +1493,10 @@ int main(int argc, char** argv) {
     RUN_TEST(test_handle_tool_call_success);
     RUN_TEST(test_handle_tool_call_handler_reports_execution_error);
     RUN_TEST(test_handle_tool_call_scalar_result_has_no_structured_content);
+    RUN_TEST(test_structured_result_text_mirroring_follows_build_flag);
+    RUN_TEST(test_tools_list_body_is_cached_between_calls);
+    RUN_TEST(test_registering_a_tool_invalidates_the_tools_list_cache);
+    RUN_TEST(test_register_tool_move_overload_registers_and_invalidates);
     RUN_TEST(test_handle_tool_call_missing_name);
     RUN_TEST(test_handle_tool_call_unknown_tool);
     RUN_TEST(test_handle_tool_call_null_handler);
