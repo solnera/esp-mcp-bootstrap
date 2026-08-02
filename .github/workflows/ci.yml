@@ -22,6 +22,11 @@ jobs:
       - name: Run native tests
         run: pio test -e native
 
+      # Builds the enabled side of MCP_OMIT_TEXT_WHEN_STRUCTURED so the
+      # opt-out cannot rot unnoticed.
+      - name: Run protocol suite with text mirroring disabled
+        run: pio test -e native-omit-text
+
       - name: Run native tests under ASan/UBSan
         run: pio test -e native-san
         env:
@@ -31,6 +36,24 @@ jobs:
           # one-time allocations (characteristics/services created in init()).
           ASAN_OPTIONS: alloc_dealloc_mismatch=1:detect_leaks=0
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      # Line coverage over src/ and include/ only; fails the job below the
+      # threshold. See scripts/coverage.sh for how the .gcda are merged.
+      - name: Line coverage (>= 80%)
+        run: ./scripts/coverage.sh 80
 
   check:
     runs-on: ubuntu-latest

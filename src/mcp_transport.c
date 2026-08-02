@@ -18,11 +18,22 @@
 
 /* RX reassembly buffer is allocated on demand and grown to fit each message,
  * then shrunk back to this baseline so a single large message does not keep
- * MAX_MESSAGE_SIZE bytes resident on the heap. */
+ * MAX_MESSAGE_SIZE bytes resident on the heap. Sized so an ordinary JSON-RPC
+ * envelope plus a tool name and small argument object fits without allocating
+ * at all — at 256 the common tools/call request landed just above it and paid
+ * for a grow on every message. */
 #ifndef MCP_TRANSPORT_RX_BASELINE_CAP
-#define MCP_TRANSPORT_RX_BASELINE_CAP 256
+#define MCP_TRANSPORT_RX_BASELINE_CAP 512
 #endif
 #define RX_BASELINE_CAP MCP_TRANSPORT_RX_BASELINE_CAP
+
+/* Growth is only handed back once the buffer is this many times the baseline.
+ * Shrinking on every message made a workload that alternates either side of the
+ * baseline realloc twice per message, which is exactly the churn that
+ * fragments a long-lived heap. */
+#ifndef MCP_TRANSPORT_RX_SHRINK_FACTOR
+#define MCP_TRANSPORT_RX_SHRINK_FACTOR 4
+#endif
 
 /* Protocol Definitions */
 #define HEADER_TYPE_MASK 0xC0
@@ -91,9 +102,11 @@ static bool rx_ensure_capacity(size_t need) {
 }
 
 /* Release any growth beyond the baseline once a message has been delivered, so a
- * single large message does not pin a large allocation for the connection's life. */
+ * single large message does not pin a large allocation for the connection's life.
+ * Hysteresis: buffers within MCP_TRANSPORT_RX_SHRINK_FACTOR x baseline are kept,
+ * so only genuinely oversized allocations are returned to the heap. */
 static void rx_shrink_to_baseline(void) {
-    if (rx_buffer_cap <= RX_BASELINE_CAP) {
+    if (rx_buffer_cap <= (size_t)RX_BASELINE_CAP * MCP_TRANSPORT_RX_SHRINK_FACTOR) {
         return;
     }
     uint8_t *shrunk = (uint8_t *)realloc(rx_buffer, RX_BASELINE_CAP);

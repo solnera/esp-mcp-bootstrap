@@ -132,21 +132,42 @@ void test_tools_list_roundtrip(void) {
     TEST_ASSERT_NULL(req._tempObject);
 }
 
-void test_tool_call_roundtrip_chunked_body(void) {
+void test_fast_tool_call_answers_inline(void) {
+    /* A handler that returns promptly is answered within the fast-path window,
+     * as an ordinary length-delimited response — no chunk framing and, more to
+     * the point, no waiting for the ~500 ms connection poll that drives the
+     * deferred filler. */
     TestServer srv;
     AsyncWebServerRequest req;
     drivePost(srv, req,
               R"({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}})",
               7);
 
-    /* tools/call is answered via a deferred chunked response: nothing inline,
-     * the result arrives once the worker task has run the handler. */
+    TEST_ASSERT_EQUAL_INT(1, req.responseCount);
+    TEST_ASSERT_FALSE(req.hasPendingResponse());
+    TEST_ASSERT_EQUAL_INT(200, req.lastCode);
+    TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "\"hi\""));
+    TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "\"id\":2"));
+    TEST_ASSERT_EQUAL_STRING("application/json", req.lastContentType.c_str());
+    TEST_ASSERT_EQUAL_STRING("2025-11-25", req.lastHeaders["MCP-Protocol-Version"].c_str());
+}
+
+void test_slow_tool_call_falls_back_to_chunked_body(void) {
+    /* Past the fast-path window the reply must still go out deferred: nothing
+     * inline, body delivered by the chunked filler once the handler returns. */
+    TestServer srv;
+    AsyncWebServerRequest req;
+    drivePost(srv, req, kGateCall);
+    TEST_ASSERT_TRUE(waitForFlag(g_gate_entered));
+
     TEST_ASSERT_EQUAL_INT(0, req.responseCount);
     TEST_ASSERT_TRUE(req.hasPendingResponse());
+
+    g_gate_open.store(true);
     TEST_ASSERT_TRUE(pumpUntilComplete(req));
     TEST_ASSERT_EQUAL_INT(1, req.responseCount);
     TEST_ASSERT_EQUAL_INT(200, req.lastCode);
-    TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "\"hi\""));
+    TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "\"gated\":true"));
     TEST_ASSERT_EQUAL_STRING("application/json", req.lastContentType.c_str());
     TEST_ASSERT_EQUAL_STRING("2025-11-25", req.lastHeaders["MCP-Protocol-Version"].c_str());
 }
@@ -524,7 +545,8 @@ int main(int argc, char** argv) {
 
     UNITY_BEGIN();
     RUN_TEST(test_tools_list_roundtrip);
-    RUN_TEST(test_tool_call_roundtrip_chunked_body);
+    RUN_TEST(test_fast_tool_call_answers_inline);
+    RUN_TEST(test_slow_tool_call_falls_back_to_chunked_body);
     RUN_TEST(test_tool_call_notification_stays_inline_202);
     RUN_TEST(test_http_1_0_tool_call_is_rejected_without_chunk_framing);
     RUN_TEST(test_tool_call_job_alloc_failure_returns_500_not_abort);

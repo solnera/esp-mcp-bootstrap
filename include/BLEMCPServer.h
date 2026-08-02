@@ -28,6 +28,13 @@
 #define MCP_BLE_RX_QUEUE_MAX_BYTES (MCP_TRANSPORT_MAX_MESSAGE_SIZE * 2)
 #endif
 
+// Stack size of the BLE RX worker task that runs tool handlers. This is
+// permanently resident RAM; a dual-transport build pays for it alongside
+// MCP_HTTP_WORKER_STACK_SIZE.
+#ifndef MCP_BLE_WORKER_STACK_SIZE
+#define MCP_BLE_WORKER_STACK_SIZE 8192
+#endif
+
 class BLEMCPServer : public MCPServerBase {
    public:
     BLEMCPServer(const String& name = "ESP32-MCP-BLE",

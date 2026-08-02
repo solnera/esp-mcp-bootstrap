@@ -21,6 +21,9 @@ jobs:
       - name: Run native tests
         run: pio test -e native
 
+      - name: Run protocol suite with text mirroring disabled
+        run: pio test -e native-omit-text
+
       - name: Run native tests under ASan/UBSan
         run: pio test -e native-san
         env:

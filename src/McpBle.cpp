@@ -82,6 +82,10 @@ void McpBle::init(const std::string& deviceName) {
 
     const std::string& name = deviceName.empty() ? _config.deviceName : deviceName;
     NimBLEDevice::init(name);
+    /* Offer a large ATT MTU before anything can connect. Without this the link
+     * stays at the 23-byte default unless the central asks for more, and every
+     * response is fragmented into 19-byte packets. */
+    NimBLEDevice::setMTU(_config.preferredMtu);
     NimBLEDevice::setPowerLevel(_config.txPower, ESP_BLE_PWR_TYPE_DEFAULT);
     NimBLEDevice::setPowerLevel(_config.advTxPower, ESP_BLE_PWR_TYPE_ADV);
 

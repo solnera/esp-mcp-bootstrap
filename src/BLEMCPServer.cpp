@@ -90,7 +90,8 @@ void BLEMCPServer::begin() {
         }
     }
     if (!task_handle) {
-        if (xTaskCreate(BLEMCPServer::taskEntry, "mcp_ble_rx", 8192, this, 1, &task_handle) != pdPASS) {
+        if (xTaskCreate(BLEMCPServer::taskEntry, "mcp_ble_rx", MCP_BLE_WORKER_STACK_SIZE, this, 1,
+                        &task_handle) != pdPASS) {
             Serial.println("[MCP_SERVER] Failed to create BLE RX task");
             vSemaphoreDelete(send_mutex);
             send_mutex = nullptr;
@@ -112,7 +113,7 @@ void BLEMCPServer::begin() {
         mcp_transport_init();
         mcp_transport_set_send_fn(BLEMCPServer::sendBytes, NULL);
         mcp_transport_set_message_cb(BLEMCPServer::onMessage, this);
-        mcp_transport_set_tx_gap_ticks(1);
+        mcp_transport_set_tx_gap_ticks(McpBle::getInstance().getConfig().txGapTicks);
         mcp_transport_set_send_retry(3, 1);
 
         McpBle::getInstance().setRxCallback([](const uint8_t* data, size_t len) {

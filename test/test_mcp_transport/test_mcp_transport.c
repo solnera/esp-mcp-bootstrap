@@ -887,23 +887,108 @@ void test_receive_multiple_fragmented_messages(void) {
     TEST_ASSERT_EQUAL_INT(2, g_message_count);
 }
 
+/* ======== MTU drives fragment count ======== */
+
+void test_larger_mtu_cuts_fragment_count(void) {
+    /* The reason BleServerConfig::preferredMtu defaults to 517 rather than
+     * leaving the 23-byte ATT default in place. Measured here rather than
+     * asserted in a comment: at MTU 23 a packet carries 19 payload bytes, at
+     * 517 it carries 511. */
+    char msg[2049];
+    for (int i = 0; i < 2048; i++) msg[i] = 'A' + (i % 26);
+    msg[2048] = '\0';
+
+    mcp_transport_set_mtu(23);
+    g_sent_packet_count = 0;
+    mcp_transport_send_message(msg);
+    int packetsAtDefaultMtu = g_sent_packet_count;
+
+    mcp_transport_set_mtu(517);
+    g_sent_packet_count = 0;
+    mcp_transport_send_message(msg);
+    int packetsAtLargeMtu = g_sent_packet_count;
+
+    /* 2048 bytes: ~108 packets at 19 bytes each, ~5 at 511. */
+    TEST_ASSERT_GREATER_THAN_INT(100, packetsAtDefaultMtu);
+    TEST_ASSERT_LESS_THAN_INT(8, packetsAtLargeMtu);
+    /* The headline claim: an order of magnitude fewer packets. */
+    TEST_ASSERT_GREATER_THAN_INT(10 * packetsAtLargeMtu, packetsAtDefaultMtu);
+
+    mcp_transport_set_mtu(23);  // restore the suite-wide default
+}
+
+/* ======== Dynamic RX buffer: shrink hysteresis ======== */
+
+/* Deliver a message of `total` bytes as START(half) + END(half). Returns
+ * whether the message was handed to the callback. */
+static bool deliver_split_message(char *scratch, size_t total) {
+    size_t half = total / 2;
+    static uint8_t start[8300];
+    static uint8_t end[8300];
+    size_t start_len;
+
+    for (size_t i = 0; i < total; i++) scratch[i] = 'A' + (int)(i % 26);
+    scratch[total] = '\0';
+
+    build_start_packet(start, &start_len, 0, total, scratch, half);
+    end[0] = 0xC0 | 1;
+    memcpy(end + 1, scratch + half, total - half);
+
+    g_message_received = 0;
+    mcp_transport_receive(start, start_len);
+    mcp_transport_receive(end, 1 + (total - half));
+    return g_message_received != 0;
+}
+
+void test_rx_buffer_within_hysteresis_is_retained(void) {
+    /* 1000 bytes is above MCP_TRANSPORT_RX_BASELINE_CAP (512) but below the
+     * shrink threshold (baseline x MCP_TRANSPORT_RX_SHRINK_FACTOR = 2048), so
+     * the grown buffer must be kept. Proof: the next same-sized message needs
+     * no allocation, and so survives an allocator that is rigged to fail. */
+    static char scratch[8192];
+    TEST_ASSERT_TRUE(deliver_split_message(scratch, 1000));
+
+    mcp_transport_test_fail_next_alloc(1);
+    TEST_ASSERT_TRUE(deliver_split_message(scratch, 1000));
+
+    /* The rigged failure was never reached — that is the point of the test —
+     * so clear it rather than letting it fire in whatever runs next. */
+    mcp_transport_test_fail_next_alloc(0);
+}
+
+void test_rx_buffer_beyond_hysteresis_is_released(void) {
+    /* 3000 bytes exceeds the shrink threshold, so the buffer is handed back to
+     * the heap after delivery. The next large message therefore does have to
+     * allocate — and fails when the allocator is rigged to fail. */
+    static char scratch[8192];
+    TEST_ASSERT_TRUE(deliver_split_message(scratch, 3000));
+
+    mcp_transport_test_fail_next_alloc(1);
+    TEST_ASSERT_FALSE(deliver_split_message(scratch, 3000));
+
+    /* Not sticky: with the allocator healthy again the transport recovers. */
+    TEST_ASSERT_TRUE(deliver_split_message(scratch, 3000));
+}
+
 /* ======== Dynamic RX buffer: allocation failure recovery ======== */
 
 void test_receive_start_alloc_failure_drops_and_recovers(void) {
     /* Message must exceed the baseline RX capacity so that START triggers a real
-     * (growing) allocation — that is the one we force to fail. */
-    char msg[401];
-    for (int i = 0; i < 400; i++) msg[i] = 'A' + (i % 26);
-    msg[400] = '\0';
-    size_t total = 400;
+     * (growing) allocation — that is the one we force to fail. Sized well clear
+     * of MCP_TRANSPORT_RX_BASELINE_CAP (512); anything inside the baseline is
+     * served from the existing buffer and never reaches the allocator. */
+    char msg[901];
+    for (int i = 0; i < 900; i++) msg[i] = 'A' + (i % 26);
+    msg[900] = '\0';
+    size_t total = 900;
 
-    /* Deliver the message as START (first 200 bytes) + END (last 200 bytes). */
-    uint8_t start[256];
+    /* Deliver the message as START (first 450 bytes) + END (last 450 bytes). */
+    uint8_t start[1024];
     size_t start_len;
-    build_start_packet(start, &start_len, 0, total, msg, 200);
-    uint8_t end[256];
+    build_start_packet(start, &start_len, 0, total, msg, 450);
+    uint8_t end[1024];
     end[0] = 0xC0 | 1;
-    memcpy(end + 1, msg + 200, 200);
+    memcpy(end + 1, msg + 450, 450);
 
     /* Force the growing allocation on the next START to fail → message dropped. */
     mcp_transport_test_fail_next_alloc(1);
@@ -911,12 +996,12 @@ void test_receive_start_alloc_failure_drops_and_recovers(void) {
     TEST_ASSERT_FALSE(g_message_received);
 
     /* A trailing END for the dropped message must be ignored, not crash. */
-    mcp_transport_receive(end, 201);
+    mcp_transport_receive(end, 451);
     TEST_ASSERT_FALSE(g_message_received);
 
     /* Transport recovers: the same large message now reassembles correctly. */
     mcp_transport_receive(start, start_len);
-    mcp_transport_receive(end, 201);
+    mcp_transport_receive(end, 451);
 
     TEST_ASSERT_TRUE(g_message_received);
     TEST_ASSERT_EQUAL_STRING(msg, g_received_message);
@@ -1030,6 +1115,9 @@ int main(void) {
 
     /* Dynamic RX buffer */
     RUN_TEST(test_receive_start_alloc_failure_drops_and_recovers);
+    RUN_TEST(test_larger_mtu_cuts_fragment_count);
+    RUN_TEST(test_rx_buffer_within_hysteresis_is_retained);
+    RUN_TEST(test_rx_buffer_beyond_hysteresis_is_released);
 
     /* Reset RX */
     RUN_TEST(test_reset_rx_aborts_in_progress_reassembly);
