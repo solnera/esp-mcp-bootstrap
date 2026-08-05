@@ -392,15 +392,15 @@ void HttpMCPServer::handleJsonBody(AsyncWebServerRequest* request, const char* b
 }
 
 void HttpMCPServer::deferToolCall(AsyncWebServerRequest* request, MCPRequest&& mcpRequest) {
-    /* Deferred responses rely on chunked framing, which needs HTTP/1.1. The
-     * pinned ESPAsyncWebServer 1.2.4 would cope with a version-0 request on
-     * its own — beginChunkedResponse (`if(_version)`, WebRequest.cpp) routes
-     * it to a non-chunked AsyncCallbackResponse whose body is close-delimited
-     * with no chunk framing (_chunked stays false) — but this library compiles
-     * against whichever fork __has_include finds, and that fallback differs
-     * across forks and is untested on hardware. Rejecting explicitly is safer
-     * than trusting it. Inline methods (initialize, tools/list, ping) still
-     * serve HTTP/1.0. */
+    /* Deferred responses rely on chunked framing, which needs HTTP/1.1.
+     * ESPAsyncWebServer would cope with a version-0 request on its own —
+     * beginChunkedResponse (`if(_version)`, WebRequest.cpp) routes it to a
+     * non-chunked AsyncCallbackResponse whose body is close-delimited with no
+     * chunk framing (_chunked stays false); that is still the shape in
+     * ESP32Async 3.12 — but this library compiles against whichever fork
+     * __has_include finds, and that fallback differs across forks and is
+     * untested on hardware. Rejecting explicitly is safer than trusting it.
+     * Inline methods (initialize, tools/list, ping) still serve HTTP/1.0. */
     if (request->version() == 0) {
         MCPResponse unsupported =
             createJSONRPCError(505, static_cast<int>(ErrorCode::SERVER_ERROR), mcpRequest.id(),
