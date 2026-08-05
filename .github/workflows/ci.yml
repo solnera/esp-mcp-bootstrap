@@ -78,11 +78,11 @@ jobs:
       matrix:
         include:
           - example: http_echo
-            libs: "me-no-dev/ESPAsyncWebServer@^1.2.4, me-no-dev/AsyncTCP@^1.1.1"
+            libs: "ESP32Async/ESPAsyncWebServer@^3.6.0, ESP32Async/AsyncTCP@^3.3.2"
           - example: ble_config_wifi
             libs: "h2zero/NimBLE-Arduino@^2.0.0"
           - example: dual_transport
-            libs: "h2zero/NimBLE-Arduino@^2.0.0, me-no-dev/ESPAsyncWebServer@^1.2.4, me-no-dev/AsyncTCP@^1.1.1"
+            libs: "h2zero/NimBLE-Arduino@^2.0.0, ESP32Async/ESPAsyncWebServer@^3.6.0, ESP32Async/AsyncTCP@^3.3.2"
     steps:
       - uses: actions/checkout@v4
 

@@ -26,8 +26,8 @@ Then add transport-specific dependencies based on your needs:
 ```ini
 lib_deps =
     solnera/ESP-MCP@^0.5.0
-    me-no-dev/ESPAsyncWebServer@^1.2.4
-    me-no-dev/AsyncTCP@^1.1.1
+    ESP32Async/ESPAsyncWebServer@^3.6.0
+    ESP32Async/AsyncTCP@^3.3.2
 ```
 
 ### BLE only
@@ -41,8 +41,8 @@ lib_deps =
 ```ini
 lib_deps =
     solnera/ESP-MCP@^0.5.0
-    me-no-dev/ESPAsyncWebServer@^1.2.4
-    me-no-dev/AsyncTCP@^1.1.1
+    ESP32Async/ESPAsyncWebServer@^3.6.0
+    ESP32Async/AsyncTCP@^3.3.2
     h2zero/NimBLE-Arduino@^2.0.0
 ```
 
@@ -167,7 +167,7 @@ All MCP protocol logic (initialize, tools/list, tools/call, etc.) is implemented
 - **Tool execution model** - `tools/call` runs on a dedicated worker task (stack `-DMCP_HTTP_WORKER_STACK_SIZE=<bytes>`, default `8192`), so handlers may block — sensor waits, `delay()`, outbound HTTP calls — without starving the `async_tcp` task or tripping the task watchdog. A call that finishes within `-DMCP_HTTP_FAST_PATH_WAIT_MS=<ms>` (default `20`) is answered inline as an ordinary length-delimited response; anything slower falls back to a chunked response (`Transfer-Encoding: chunked`), which HTTP/1.1 libraries decode transparently. The fast path matters because the deferred body can only be written when the connection next polls — one lwIP coarse tick, roughly 500 ms — so without it even a 2 ms tool answered in half a second. The cost is that `async_tcp` is blocked for at most that window; set the flag to `0` to always defer. Either way HTTP/1.0 `tools/call` requests are rejected with `505 HTTP Version Not Supported`, since the fallback still needs chunked framing. `initialize`, `tools/list`, `ping`, notifications, and every transport-level rejection are still answered inline — those are pure in-memory JSON work. If the worker task cannot be created (out of memory during `begin()`), `tools/call` degrades to inline execution and a log line reports it; handlers must then return quickly.
 - Pending tool calls are bounded (`-DMCP_HTTP_JOB_QUEUE_DEPTH=<n>`, default `4`); when the queue is full the server immediately answers JSON-RPC error `-32000` ("Server busy") so clients can back off and retry. Tool calls execute one at a time, in arrival order. A per-call job allocation that fails under memory pressure is answered with JSON-RPC `-32603` (HTTP `500`) instead of aborting, in both exception modes; allocations made while a handler runs (JSON documents, the serialized result) keep the library-wide fail-fast policy.
 - A client disconnect does not cancel a running tool: execution always completes — tools have side effects (a WiFi-reconfig tool must finish even though reconfiguring drops the link) — and the result is discarded if nobody is left to read it. Slow tools are bounded by the client's HTTP timeout, not by the server.
-- POST bodies are capped at `8192` bytes (`-DMCP_HTTP_MAX_BODY_SIZE=<bytes>`); larger requests are rejected with HTTP `413` before any buffering, so a hostile Content-Length cannot exhaust the heap. Non-JSON content types get `415`. A request without a usable Content-Length is answered `411` as a defensive fallback (ESPAsyncWebServer 1.2.x does not support chunked request bodies).
+- POST bodies are capped at `8192` bytes (`-DMCP_HTTP_MAX_BODY_SIZE=<bytes>`); larger requests are rejected with HTTP `413` before any buffering, so a hostile Content-Length cannot exhaust the heap. Non-JSON content types get `415`. A request without a usable Content-Length is answered `411`: the body buffer is sized up front from the declared length, so a chunked request body has nothing to size against. ESPAsyncWebServer gained chunked *request* body parsing in 3.11, but this library does not rely on it — MCP clients send Content-Length, and the fixed-size buffer is what keeps `MCP_HTTP_MAX_BODY_SIZE` enforceable before any allocation.
 - JSON-RPC notifications receive `202 Accepted` with no body, per the MCP Streamable HTTP transport.
 
 ### BLEMCPServer
